@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = { role: location.hash === "#supplier" ? "supplier" : "admin", bootstrap: null, demands: [] };
+const state = { role: location.hash === "#supplier" ? "supplier" : "admin", bootstrap: null, demands: [], directImportEnabled: false };
 
 async function api(path, options = {}) {
   const response = await fetch(path, { credentials: "same-origin", ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
@@ -165,13 +165,17 @@ async function loadSupplies() {
 
 async function loadSupplier() {
   const data = await api("/api/supplier/demand");
+  const previousGroupId = Number($("supplyGroup").value || 0);
   state.demands = data.demands;
+  state.directImportEnabled = data.direct_import_enabled;
   hide("adminView"); show("supplierView");
   $("connectionState").textContent = "供应商会话";
   $("supplierModeText").textContent = data.direct_import_enabled ? "管理员已开启直接补号。" : "管理员尚未开启直接补号，目前只能查看需求。";
   $("demandGrid").innerHTML = data.demands.length ? data.demands.map((item) => `<article class="demand-card"><div class="demand-top"><span class="group-name"><i class="group-dot" style="--group-color:${esc(item.color || "#777")}"></i>检查：${esc(item.group_name)}</span><span class="state-badge ${item.accepting ? "triggered" : "disabled"}">${item.accepting ? "可提交" : "暂不接收"}</span></div><div class="demand-number">${item.needed}</div><span class="subtext">需要补充的存活账号</span><ul>${(item.reasons || []).map((reason) => `<li>${esc(reason)}</li>`).join("")}<li>入组：${(item.target_group_names || []).map(esc).join(" + ")}</li></ul>${item.note ? `<p class="subtext">备注：${esc(item.note)}</p>` : ""}</article>`).join("") : `<div class="empty">当前没有已启用的补号策略</div>`;
-  $("supplyGroup").innerHTML = data.demands.map((item) => `<option value="${item.group_id}" ${item.accepting ? "" : "disabled"}>${esc(item.group_name)} · 需要 ${item.needed}</option>`).join("");
-  $("submitSupply").disabled = !data.direct_import_enabled || !data.demands.some((item) => item.accepting);
+  $("supplyGroup").innerHTML = data.demands.map((item) => `<option value="${item.group_id}">${esc(item.group_name)} · 需要 ${item.needed} · ${item.accepting ? "可提交" : "暂不接收"}</option>`).join("");
+  const selected = data.demands.find((item) => item.group_id === previousGroupId) || data.demands.find((item) => item.accepting) || data.demands[0];
+  if (selected) $("supplyGroup").value = String(selected.group_id);
+  $("supplyGroup").disabled = data.demands.length === 0;
   updateSupplierLimit();
 }
 
@@ -179,7 +183,8 @@ function updateSupplierLimit() {
   const selected = state.demands.find((item) => item.group_id === Number($("supplyGroup").value));
   const tokenCount = $("supplyTokens").value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length;
   $("supplierTokenCount").textContent = `${tokenCount} 个 Token`;
-  $("supplierLimit").textContent = `当前最多接收 ${selected?.needed || 0} 个`;
+  $("supplierLimit").textContent = selected?.accepting ? `当前最多接收 ${selected.needed} 个` : selected ? `当前暂不接收：${(selected.reasons || []).join("；") || "策略未触发"}` : "当前没有检查策略";
+  $("submitSupply").disabled = !state.directImportEnabled || !selected?.accepting;
 }
 
 async function submitSupply(event) {
