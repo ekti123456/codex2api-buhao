@@ -54,7 +54,7 @@ class Config:
             raise RuntimeError("CODEX2API_BASE_URL 必须是完整的 http/https 地址")
         return cls(
             host=os.getenv("POOL_MANAGER_HOST", "127.0.0.1"),
-            port=int(os.getenv("POOL_MANAGER_PORT", "8790")),
+            port=configured_port(),
             base_url=required["CODEX2API_BASE_URL"],
             admin_key=required["CODEX2API_ADMIN_KEY"],
             admin_password=required["POOL_MANAGER_ADMIN_PASSWORD"],
@@ -72,6 +72,15 @@ def utc_now() -> datetime:
 
 def iso_now() -> str:
     return utc_now().isoformat().replace("+00:00", "Z")
+
+
+def configured_port() -> int:
+    # PaaS 平台通常注入 PORT 或 WEB_PORT；Docker Compose 则使用 POOL_MANAGER_PORT。
+    for name in ("PORT", "WEB_PORT", "POOL_MANAGER_PORT"):
+        value = os.getenv(name, "").strip()
+        if value.isdigit() and 1 <= int(value) <= 65535:
+            return int(value)
+    return 8790
 
 
 def default_settings() -> dict[str, Any]:

@@ -1,8 +1,9 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
-from server import Config, Manager, default_settings, is_usable, reconcile_policies, validate_settings
+from server import Config, Manager, configured_port, default_settings, is_usable, reconcile_policies, validate_settings
 
 
 class ManagerLogicTests(unittest.TestCase):
@@ -21,6 +22,12 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertFalse(is_usable({"status": "cooldown"}))
         self.assertFalse(is_usable({"status": "active", "enabled": False}))
         self.assertFalse(is_usable({"status": "active", "health_tier": "banned"}))
+
+    def test_platform_port_variables_are_supported(self):
+        with patch.dict("os.environ", {"PORT": "${WEB_PORT}", "WEB_PORT": "9123", "POOL_MANAGER_PORT": "8790"}, clear=True):
+            self.assertEqual(9123, configured_port())
+        with patch.dict("os.environ", {"PORT": "9234", "POOL_MANAGER_PORT": "8790"}, clear=True):
+            self.assertEqual(9234, configured_port())
 
     def test_reconcile_creates_safe_disabled_policy(self):
         policies = reconcile_policies([], [{"id": 3, "name": "PRO", "member_count": 7}])

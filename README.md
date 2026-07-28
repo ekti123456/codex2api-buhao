@@ -69,6 +69,10 @@ docker compose up -d --build
 - 限制供应商入口的来源 IP 或再加一层 Cloudflare Access / VPN；
 - 不要把供应商密钥放进 URL、聊天消息或前端代码。
 
+Compose 默认使用名为 `pool-manager-data` 的 Docker 卷，避免宿主机 `./data` 由 root 创建后，非 root 容器无法写入 SQLite。`.env` 文件不是强制的：既可以放在仓库目录，也可以由服务器面板或 Shell 注入同名环境变量。
+
+在 Railway、Zeabur 等动态端口平台，程序会按 `PORT`、`WEB_PORT`、`POOL_MANAGER_PORT` 的顺序选择第一个有效数字端口；类似 `PORT=${WEB_PORT}` 的模板值也能回退读取实际的 `WEB_PORT`。通用的 `PASSWORD` 变量不会被读取，管理员密码必须使用 `POOL_MANAGER_ADMIN_PASSWORD`。
+
 ## 供应商 API
 
 供应商无需先创建网页会话，使用管理员创建的密钥即可查询实际缺口：

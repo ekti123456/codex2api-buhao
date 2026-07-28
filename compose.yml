@@ -2,14 +2,21 @@ services:
   account-pool-manager:
     build: .
     restart: unless-stopped
-    env_file: .env
     environment:
+      CODEX2API_BASE_URL: ${CODEX2API_BASE_URL:-}
+      CODEX2API_ADMIN_KEY: ${CODEX2API_ADMIN_KEY:-}
+      POOL_MANAGER_ADMIN_PASSWORD: ${POOL_MANAGER_ADMIN_PASSWORD:-}
       POOL_MANAGER_HOST: 0.0.0.0
+      POOL_MANAGER_PORT: ${POOL_MANAGER_PORT:-8790}
       POOL_MANAGER_SECURE_COOKIE: "true"
+      POOL_MANAGER_SESSION_HOURS: ${POOL_MANAGER_SESSION_HOURS:-12}
+      POOL_MANAGER_HTTP_TIMEOUT_SECONDS: ${POOL_MANAGER_HTTP_TIMEOUT_SECONDS:-30}
+      POOL_MANAGER_ACCOUNT_VERIFY_SECONDS: ${POOL_MANAGER_ACCOUNT_VERIFY_SECONDS:-60}
+      POOL_MANAGER_DATABASE_FILE: /app/data/pool-manager.sqlite3
     ports:
       - "127.0.0.1:8790:8790"
     volumes:
-      - ./data:/app/data
+      - pool-manager-data:/app/data
     read_only: true
     tmpfs:
       - /tmp
@@ -17,3 +24,6 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+volumes:
+  pool-manager-data:
