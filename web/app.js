@@ -11,6 +11,12 @@ async function api(path, options = {}) {
 
 function esc(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char])); }
 function pct(value) { return value == null ? "暂无样本" : `${Number(value).toFixed(1)}%`; }
+function durationText(minutes) {
+  if (minutes == null) return "待验活";
+  const total = Math.max(0, Number(minutes) || 0);
+  const hours = Math.floor(total / 60); const remainder = total % 60;
+  return hours ? `${hours} 小时 ${remainder} 分钟` : `${remainder} 分钟`;
+}
 function show(id) { $(id).classList.remove("hidden"); }
 function hide(id) { $(id).classList.add("hidden"); }
 
@@ -72,6 +78,7 @@ function renderAdmin() {
 
   const global = data.settings.global;
   $("evaluationInterval").value = global.evaluation_interval_minutes;
+  $("accountHealthInterval").value = global.account_health_interval_minutes;
   $("cooldownMinutes").value = global.replenish_cooldown_minutes;
   $("maxPerRun").value = global.max_accounts_per_run;
   $("triggerMode").value = global.trigger_mode;
@@ -105,6 +112,7 @@ function collectSettings() {
     updated_at: new Date().toISOString(),
     global: {
       evaluation_interval_minutes: Number($("evaluationInterval").value),
+      account_health_interval_minutes: Number($("accountHealthInterval").value),
       replenish_cooldown_minutes: Number($("cooldownMinutes").value),
       max_accounts_per_run: Number($("maxPerRun").value),
       trigger_mode: $("triggerMode").value,
@@ -215,15 +223,34 @@ async function loadSupplies() {
   const query = new URLSearchParams();
   if ($("supplyFilterSupplier").value) query.set("supplier_id", $("supplyFilterSupplier").value);
   if ($("supplyFilterStatus").value) query.set("status", $("supplyFilterStatus").value);
+  if ($("supplyFilterHealth").value) query.set("health", $("supplyFilterHealth").value);
   if ($("supplyFilterFrom").value) query.set("date_from", $("supplyFilterFrom").value);
   if ($("supplyFilterTo").value) query.set("date_to", $("supplyFilterTo").value);
   const data = await api(`/api/admin/supplies${query.size ? `?${query}` : ""}`);
   const groupNames = new Map((state.bootstrap?.groups || []).map((item) => [Number(item.id), item.name]));
-  $("suppliedAccountRows").innerHTML = data.accounts.length ? data.accounts.map((item) => `<tr><td>${new Date(item.created_at).toLocaleString()}</td><td>${esc(item.supplier_name)}</td><td>${item.upstream_account_id ? `ID ${item.upstream_account_id}` : "未创建"}<span class="subtext">${esc(item.account_name || "")}</span></td><td>${esc(item.email || "-")}</td><td><span class="${item.status === "accepted" ? "status-ok" : "status-bad"}">${item.status === "accepted" ? "存活并已入组" : "拒绝"}</span>${item.error_message ? `<span class="subtext">${esc(item.error_message)}</span>` : ""}</td><td>${item.target_group_ids.map((id) => esc(groupNames.get(Number(id)) || `ID ${id}`)).join(" + ")}</td></tr>`).join("") : `<tr><td colspan="6" class="empty">没有符合筛选条件的补号账号</td></tr>`;
+  $("suppliedAccountRows").innerHTML = data.accounts.length ? data.accounts.map((item) => {
+    const health = item.status !== "accepted" ? `<span class="subtext">不适用</span>` : item.health_alive === true
+      ? `<span class="status-ok">存活</span><span class="subtext">${esc(item.health_status || "active")} · ${new Date(item.health_checked_at).toLocaleString()}</span>`
+      : item.health_alive === false
+        ? `<span class="status-bad">${item.health_status === "not_found" ? "上游未找到" : "不可用"}</span><span class="subtext">${esc(item.health_status || "unknown")} · ${new Date(item.health_checked_at).toLocaleString()}</span>`
+        : `<span class="subtext">等待首次定时验活</span>`;
+    return `<tr><td>${new Date(item.created_at).toLocaleString()}</td><td>${esc(item.supplier_name)}</td><td>${item.upstream_account_id ? `ID ${item.upstream_account_id}` : "未创建"}<span class="subtext">${esc(item.account_name || "")}</span></td><td>${esc(item.email || "-")}</td><td><span class="${item.status === "accepted" ? "status-ok" : "status-bad"}">${item.status === "accepted" ? "通过" : "拒绝"}</span>${item.error_message ? `<span class="subtext">${esc(item.error_message)}</span>` : ""}</td><td>${health}</td><td>${item.status === "accepted" ? esc(durationText(item.alive_minutes)) : "-"}</td><td>${item.target_group_ids.map((id) => esc(groupNames.get(Number(id)) || `ID ${id}`)).join(" + ")}</td></tr>`;
+  }).join("") : `<tr><td colspan="8" class="empty">没有符合筛选条件的补号账号</td></tr>`;
+}
+
+async function checkSuppliesHealth() {
+  const button = $("checkSuppliesHealth");
+  button.disabled = true; button.textContent = "验活中…"; $("supplyHealthState").textContent = "正在批量比对";
+  try {
+    const result = await api("/api/admin/supplies/health-check", { method: "POST", body: "{}" });
+    $("supplyHealthState").textContent = `已检查 ${result.checked} · 存活 ${result.alive} · 不可用 ${result.unavailable + result.missing}`;
+    await Promise.all([loadSupplies(), loadAudit()]);
+  } catch (error) { $("supplyHealthState").textContent = error.message; }
+  finally { button.disabled = false; button.textContent = "立即验活"; }
 }
 
 function resetSupplyFilters() {
-  for (const id of ["supplyFilterSupplier", "supplyFilterStatus", "supplyFilterFrom", "supplyFilterTo"]) $(id).value = "";
+  for (const id of ["supplyFilterSupplier", "supplyFilterStatus", "supplyFilterHealth", "supplyFilterFrom", "supplyFilterTo"]) $(id).value = "";
   loadSupplies();
 }
 
@@ -274,6 +301,7 @@ window.addEventListener("hashchange", () => location.reload());
 $("loginForm").addEventListener("submit", login); $("logoutButton").addEventListener("click", logout);
 $("refreshAdmin").addEventListener("click", loadAdmin); $("saveSettings").addEventListener("click", saveSettings); $("refreshAudit").addEventListener("click", loadAudit);
 $("createSupplier").addEventListener("click", createSupplier); $("copySupplierKey").addEventListener("click", copySupplierKey); $("refreshSupplies").addEventListener("click", loadSupplies);
+$("checkSuppliesHealth").addEventListener("click", checkSuppliesHealth);
 $("applySupplyFilters").addEventListener("click", loadSupplies); $("resetSupplyFilters").addEventListener("click", resetSupplyFilters);
 $("applyAuditFilters").addEventListener("click", loadAudit); $("resetAuditFilters").addEventListener("click", resetAuditFilters);
 $("refreshSupplier").addEventListener("click", loadSupplier); $("supplyGroup").addEventListener("change", updateSupplierLimit); $("supplyTokens").addEventListener("input", updateSupplierLimit); $("supplyForm").addEventListener("submit", submitSupply);

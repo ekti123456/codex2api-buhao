@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>账号池补号中心</title>
   <link rel="stylesheet" href="/app.css?v=5">
-  <link rel="stylesheet" href="/admin.css?v=6">
+  <link rel="stylesheet" href="/admin.css?v=7">
 </head>
 <body>
   <div class="page-shell">
@@ -47,6 +47,7 @@
           <div class="panel-head"><div><h2>全局设置</h2><p>决定策略多久评估一次、两次补号之间的间隔以及供应商权限。</p></div><span class="save-state" id="saveState"></span></div>
           <div class="settings-grid">
             <label>评估间隔（分钟）<input id="evaluationInterval" type="number" min="1" max="1440"></label>
+            <label>供应商账号验活（分钟）<input id="accountHealthInterval" type="number" min="1" max="1440"><small>默认 10，按整点时间边界批量检查</small></label>
             <label>补号冷却（分钟）<input id="cooldownMinutes" type="number" min="0" max="10080"></label>
             <label>单次补号上限<input id="maxPerRun" type="number" min="1" max="100"></label>
             <label>条件组合<select id="triggerMode"><option value="any">任一条件触发</option><option value="all">全部条件触发</option></select></label>
@@ -66,15 +67,16 @@
         </section>
 
         <section class="panel">
-          <div class="panel-head"><div><h2>供应商补号账号</h2><p>查看账号由哪个供应商提交、是否通过存活校验，以及最终进入的目标分组。</p></div><button class="button ghost" id="refreshSupplies">刷新</button></div>
+          <div class="panel-head"><div><h2>供应商补号账号</h2><p>定时批量比对上游账号状态；也可随时手动验活，不处理 Codex2API 的锁定标记。</p></div><div class="heading-actions"><span class="save-state" id="supplyHealthState"></span><button class="button" id="checkSuppliesHealth">立即验活</button><button class="button ghost" id="refreshSupplies">刷新记录</button></div></div>
           <div class="filter-bar">
             <label>供应商<select id="supplyFilterSupplier"><option value="">全部供应商</option></select></label>
             <label>结果<select id="supplyFilterStatus"><option value="">全部结果</option><option value="accepted">通过</option><option value="rejected">拒绝</option></select></label>
+            <label>当前验活<select id="supplyFilterHealth"><option value="">全部状态</option><option value="alive">存活</option><option value="unavailable">不可用</option><option value="unchecked">待验活</option></select></label>
             <label>开始日期<input id="supplyFilterFrom" type="date"></label>
             <label>结束日期<input id="supplyFilterTo" type="date"></label>
             <button class="button" id="applySupplyFilters" type="button">筛选</button><button class="button ghost" id="resetSupplyFilters" type="button">重置</button>
           </div>
-          <div class="table-scroll"><table class="policy-table compact-table"><thead><tr><th>时间</th><th>供应商</th><th>账号</th><th>邮箱</th><th>校验结果</th><th>目标分组</th></tr></thead><tbody id="suppliedAccountRows"></tbody></table></div>
+          <div class="table-scroll"><table class="policy-table compact-table"><thead><tr><th>导入时间</th><th>供应商</th><th>账号</th><th>邮箱</th><th>导入校验</th><th>当前验活</th><th>存活时长</th><th>目标分组</th></tr></thead><tbody id="suppliedAccountRows"></tbody></table></div>
         </section>
 
         <section class="panel">
@@ -122,6 +124,6 @@
       </section>
     </main>
   </div>
-  <script src="/app.js?v=6" defer></script>
+  <script src="/app.js?v=7" defer></script>
 </body>
 </html>

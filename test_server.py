@@ -1,9 +1,10 @@
 import tempfile
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 from pathlib import Path
 
-from server import Config, Manager, configured_port, default_settings, is_usable, reconcile_policies, utc_now, validate_settings
+from server import Config, Manager, configured_port, default_settings, is_usable, reconcile_policies, seconds_until_interval_boundary, utc_now, validate_settings
 
 
 class ManagerLogicTests(unittest.TestCase):
@@ -28,6 +29,10 @@ class ManagerLogicTests(unittest.TestCase):
             self.assertEqual(9123, configured_port())
         with patch.dict("os.environ", {"PORT": "9234", "POOL_MANAGER_PORT": "8790"}, clear=True):
             self.assertEqual(9234, configured_port())
+
+    def test_health_schedule_uses_exact_interval_boundaries(self):
+        self.assertEqual(599, seconds_until_interval_boundary(601, 10))
+        self.assertEqual(600, seconds_until_interval_boundary(600, 10))
 
     def test_reconcile_creates_safe_disabled_policy(self):
         policies = reconcile_policies([], [{"id": 3, "name": "PRO", "member_count": 7}])
@@ -139,6 +144,40 @@ class ManagerLogicTests(unittest.TestCase):
         audited = manager.audit_entries(supplier_id=first["id"], role="supplier", event="success", date_from="2026-07-27", date_to="2026-07-27")
         self.assertEqual(1, len(audited))
         self.assertEqual("supply_success", audited[0]["event"])
+
+    def test_supplier_account_health_check_lists_upstream_once(self):
+        manager = self.make_manager()
+        supplier = manager.create_supplier("验活供应商")
+        created_at = (utc_now() - timedelta(minutes=65)).isoformat().replace("+00:00", "Z")
+        with manager.db() as db:
+            batch_id = db.execute(
+                "INSERT INTO supply_batches(supplier_id,check_group_id,target_group_ids_json,requested_count,status,created_at) VALUES(?,?,?,?,?,?)",
+                (supplier["id"], 1, "[1]", 3, "completed", created_at),
+            ).lastrowid
+            for account_id in (11, 12, 13):
+                db.execute(
+                    "INSERT INTO supplied_accounts(batch_id,supplier_id,upstream_account_id,status,target_group_ids_json,created_at) VALUES(?,?,?,?,?,?)",
+                    (batch_id, supplier["id"], account_id, "accepted", "[1]", created_at),
+                )
+        calls = []
+
+        def upstream(method, path, body=None):
+            calls.append((method, path))
+            return {"accounts": [
+                {"id": 11, "status": "active", "health_tier": "healthy", "enabled": True, "locked": True},
+                {"id": 12, "status": "active", "enabled": False},
+            ]}
+
+        manager.upstream = upstream
+        result = manager.check_supplier_accounts_health("test")
+        self.assertEqual({"checked": 3, "alive": 1, "unavailable": 1, "missing": 1}, {key: result[key] for key in ("checked", "alive", "unavailable", "missing")})
+        self.assertEqual([("GET", "/api/admin/accounts")], calls)
+        alive = manager.supply_history(health="alive")
+        self.assertEqual([11], [item["upstream_account_id"] for item in alive])
+        self.assertGreaterEqual(alive[0]["alive_minutes"], 65)
+        self.assertTrue(alive[0]["health_alive"])
+        unavailable = manager.supply_history(health="unavailable")
+        self.assertEqual({12, 13}, {item["upstream_account_id"] for item in unavailable})
 
     def test_supplier_demand_explains_cooldown_without_exposing_target_groups(self):
         manager = self.make_manager()

@@ -19,7 +19,7 @@
 .target-groups { min-width: 150px; min-height: 76px; padding: 5px; }
 .status-ok { color: var(--green); font-weight: 700; }
 .status-bad { color: var(--red); font-weight: 700; }
-.filter-bar { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)) auto auto; gap: 10px; align-items: end; padding: 14px 18px; border-bottom: 1px solid var(--line); background: #fafbfa; }
+.filter-bar { display: grid; grid-template-columns: repeat(5, minmax(125px, 1fr)) auto auto; gap: 10px; align-items: end; padding: 14px 18px; border-bottom: 1px solid var(--line); background: #fafbfa; }
 .filter-bar .button { min-height: 39px; }
 
 @media (max-width: 650px) {

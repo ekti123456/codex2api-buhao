@@ -89,6 +89,7 @@ def default_settings() -> dict[str, Any]:
         "updated_at": iso_now(),
         "global": {
             "evaluation_interval_minutes": 5,
+            "account_health_interval_minutes": 10,
             "replenish_cooldown_minutes": 60,
             "max_accounts_per_run": 20,
             "trigger_mode": "any",
@@ -103,6 +104,8 @@ class Manager:
         self.config = config
         self.lock = threading.RLock()
         self.supply_lock = threading.Lock()
+        self.health_check_lock = threading.Lock()
+        self.health_schedule_wakeup = threading.Event()
         self.sessions: dict[str, dict[str, Any]] = {}
         self.login_attempts: dict[str, dict[str, Any]] = {}
         self._init_database()
@@ -159,6 +162,10 @@ class Manager:
                     status TEXT NOT NULL,
                     target_group_ids_json TEXT NOT NULL,
                     error_message TEXT,
+                    health_alive INTEGER,
+                    health_status TEXT,
+                    health_checked_at TEXT,
+                    health_last_alive_at TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_log (
@@ -178,6 +185,15 @@ class Manager:
             supplier_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(suppliers)").fetchall()}
             if "deleted" not in supplier_columns:
                 db.execute("ALTER TABLE suppliers ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+            supplied_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(supplied_accounts)").fetchall()}
+            for name, definition in {
+                "health_alive": "INTEGER",
+                "health_status": "TEXT",
+                "health_checked_at": "TEXT",
+                "health_last_alive_at": "TEXT",
+            }.items():
+                if name not in supplied_columns:
+                    db.execute(f"ALTER TABLE supplied_accounts ADD COLUMN {name} {definition}")
 
     def _load_settings(self) -> dict[str, Any]:
         with self.db() as db:
@@ -188,6 +204,7 @@ class Manager:
                 db.execute("INSERT INTO app_settings(key,value_json,updated_at) VALUES('settings',?,?)", (json.dumps(data, ensure_ascii=False), iso_now()))
             return data
         data = json.loads(row["value_json"])
+        data.setdefault("global", {}).setdefault("account_health_interval_minutes", 10)
         validate_settings(data)
         return data
 
@@ -199,6 +216,7 @@ class Manager:
             db.execute("INSERT INTO app_settings(key,value_json,updated_at) VALUES('settings',?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at", (json.dumps(value, ensure_ascii=False), value["updated_at"]))
         with self.lock:
             self.settings = value
+        self.health_schedule_wakeup.set()
         self.append_audit("settings_updated", "admin", "补号策略已更新")
 
     def settings_snapshot(self) -> dict[str, Any]:
@@ -353,7 +371,7 @@ class Manager:
         self.append_audit("supplier_deleted", "admin", f"删除供应商 ID {supplier_id}", supplier_id=supplier_id)
         return {"ok": True}
 
-    def supply_history(self, limit: int = 500, supplier_id: int = 0, status: str = "", date_from: str = "", date_to: str = "") -> list[dict[str, Any]]:
+    def supply_history(self, limit: int = 500, supplier_id: int = 0, status: str = "", health: str = "", date_from: str = "", date_to: str = "") -> list[dict[str, Any]]:
         clauses, values = [], []
         if supplier_id > 0:
             clauses.append("a.supplier_id=?"); values.append(supplier_id)
@@ -361,6 +379,10 @@ class Manager:
             if status not in {"accepted", "rejected"}:
                 raise ValueError("补号结果筛选无效")
             clauses.append("a.status=?"); values.append(status)
+        if health:
+            if health not in {"alive", "unavailable", "unchecked"}:
+                raise ValueError("当前验活筛选无效")
+            clauses.append({"alive": "a.health_alive=1", "unavailable": "a.health_alive=0", "unchecked": "a.health_alive IS NULL AND a.status='accepted'"}[health])
         if date_from:
             clauses.append("date(a.created_at)>=date(?)"); values.append(validate_date_filter(date_from))
         if date_to:
@@ -369,14 +391,56 @@ class Manager:
         with self.db() as db:
             rows = db.execute(f"""
                 SELECT a.id,a.batch_id,a.supplier_id,s.name supplier_name,a.upstream_account_id,
-                       a.account_name,a.email,a.status,a.target_group_ids_json,a.error_message,a.created_at
+                       a.account_name,a.email,a.status,a.target_group_ids_json,a.error_message,
+                       a.health_alive,a.health_status,a.health_checked_at,a.health_last_alive_at,a.created_at
                 FROM supplied_accounts a JOIN suppliers s ON s.id=a.supplier_id
                 {where} ORDER BY a.id DESC LIMIT ?
             """, (*values, limit)).fetchall()
         output = []
         for row in rows:
-            item = dict(row); item["target_group_ids"] = json.loads(item.pop("target_group_ids_json")); output.append(item)
+            item = dict(row)
+            item["target_group_ids"] = json.loads(item.pop("target_group_ids_json"))
+            item["health_alive"] = None if item["health_alive"] is None else bool(item["health_alive"])
+            end = iso_now() if item["health_alive"] else item.get("health_last_alive_at")
+            item["alive_minutes"] = elapsed_minutes(item["created_at"], end) if item["status"] == "accepted" and end else None
+            output.append(item)
         return output
+
+    def check_supplier_accounts_health(self, role: str = "system") -> dict[str, Any]:
+        if role not in {"admin", "system", "test"}:
+            raise ValueError("验活角色无效")
+        with self.health_check_lock:
+            payload = self.upstream("GET", "/api/admin/accounts")
+            accounts = {int(item["id"]): item for item in payload.get("accounts", []) if item.get("id") is not None}
+            now = iso_now()
+            with self.db() as db:
+                rows = db.execute("SELECT id,upstream_account_id FROM supplied_accounts WHERE status='accepted' AND upstream_account_id IS NOT NULL").fetchall()
+                alive = unavailable = missing = 0
+                for row in rows:
+                    account = accounts.get(int(row["upstream_account_id"]))
+                    usable = bool(account and is_usable(account))
+                    if account is None:
+                        health_status = "not_found"
+                        missing += 1
+                    else:
+                        status = str(account.get("status") or "unknown")
+                        tier = str(account.get("health_tier") or "").strip()
+                        health_status = f"{status} / {tier}" if tier else status
+                        if usable:
+                            alive += 1
+                        else:
+                            unavailable += 1
+                    db.execute(
+                        "UPDATE supplied_accounts SET health_alive=?,health_status=?,health_checked_at=?,health_last_alive_at=CASE WHEN ?=1 THEN ? ELSE health_last_alive_at END WHERE id=?",
+                        (1 if usable else 0, health_status, now, 1 if usable else 0, now, int(row["id"])),
+                    )
+            checked = len(rows)
+            self.append_audit(
+                "supplier_accounts_health_checked", role,
+                f"供应商账号验活：共 {checked}，存活 {alive}，不可用 {unavailable}，未找到 {missing}",
+                count=checked,
+            )
+            return {"ok": True, "checked": checked, "alive": alive, "unavailable": unavailable, "missing": missing, "checked_at": now}
 
     def remove_session(self, token: str) -> None:
         with self.lock:
@@ -555,6 +619,20 @@ class Manager:
 
         threading.Thread(target=monitor, name="pool-demand-monitor", daemon=True).start()
 
+        def health_monitor() -> None:
+            while True:
+                interval_minutes = max(1, int(self.settings_snapshot()["global"]["account_health_interval_minutes"]))
+                wait_seconds = seconds_until_interval_boundary(time.time(), interval_minutes)
+                if self.health_schedule_wakeup.wait(wait_seconds):
+                    self.health_schedule_wakeup.clear()
+                    continue
+                try:
+                    self.check_supplier_accounts_health("system")
+                except Exception as error:  # noqa: BLE001
+                    print(f"supplier health monitor warning: {type(error).__name__}")
+
+        threading.Thread(target=health_monitor, name="supplier-account-health-monitor", daemon=True).start()
+
     def supply(self, supplier_id: int, group_id: int, token_text: str, proxy_url: str) -> dict[str, Any]:
         with self.supply_lock:
             return self._supply_locked(supplier_id, group_id, token_text, proxy_url)
@@ -630,9 +708,21 @@ class Manager:
                         self.upstream("DELETE", f"/api/admin/accounts/{int(account['id'])}")
                     except Exception as cleanup_error:  # noqa: BLE001
                         print(f"supplier rejected account cleanup failed: {type(cleanup_error).__name__}")
+            recorded_at = iso_now()
             with self.db() as db:
-                db.execute("""INSERT INTO supplied_accounts(batch_id,supplier_id,upstream_account_id,account_name,email,status,target_group_ids_json,error_message,created_at)
-                              VALUES(?,?,?,?,?,?,?,?,?)""", (batch_id, supplier_id, int(account["id"]) if account else None, str(account.get("name", "")) if account else name, str(account.get("email", "")) if account else "", status, json.dumps(target_group_ids), safe_error or None, iso_now()))
+                db.execute("""INSERT INTO supplied_accounts(
+                                  batch_id,supplier_id,upstream_account_id,account_name,email,status,target_group_ids_json,error_message,
+                                  health_alive,health_status,health_checked_at,health_last_alive_at,created_at
+                              ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    batch_id, supplier_id, int(account["id"]) if account else None,
+                    str(account.get("name", "")) if account else name, str(account.get("email", "")) if account else "",
+                    status, json.dumps(target_group_ids), safe_error or None,
+                    1 if status == "accepted" else None,
+                    str(account.get("status") or "unknown") if account and status == "accepted" else None,
+                    recorded_at if status == "accepted" else None,
+                    recorded_at if status == "accepted" else None,
+                    recorded_at,
+                ))
             results.append({"status": status, "account_id": int(account["id"]) if account and status == "accepted" else None})
 
         with self.db() as db:
@@ -649,6 +739,7 @@ class Manager:
 def validate_settings(data: dict[str, Any]) -> None:
     global_settings = data.get("global") or {}
     bounded(global_settings.get("evaluation_interval_minutes"), 1, 1440, "评估间隔")
+    bounded(global_settings.get("account_health_interval_minutes"), 1, 1440, "供应商账号验活间隔")
     bounded(global_settings.get("replenish_cooldown_minutes"), 0, 10080, "补号冷却")
     bounded(global_settings.get("max_accounts_per_run"), 1, 100, "单次补号上限")
     if global_settings.get("trigger_mode") not in {"any", "all"}:
@@ -687,6 +778,21 @@ def validate_date_filter(value: str) -> str:
     except ValueError as error:
         raise ValueError("日期筛选必须是 YYYY-MM-DD") from error
     return value
+
+
+def elapsed_minutes(start: str, end: str) -> int:
+    try:
+        start_time = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        end_time = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        return max(0, int((end_time - start_time).total_seconds() // 60))
+    except (TypeError, ValueError):
+        return 0
+
+
+def seconds_until_interval_boundary(timestamp: float, interval_minutes: int) -> float:
+    interval = max(1, int(interval_minutes)) * 60
+    remainder = timestamp % interval
+    return float(interval if remainder < 0.001 else interval - remainder)
 
 
 def reconcile_policies(existing: list[dict[str, Any]], groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -747,7 +853,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.protected("admin", lambda: {"suppliers": self.manager.list_suppliers()})
         if path == "/api/admin/supplies":
             return self.protected("admin", lambda: {"accounts": self.manager.supply_history(
-                supplier_id=self.query_int("supplier_id"), status=self.query_value("status"),
+                supplier_id=self.query_int("supplier_id"), status=self.query_value("status"), health=self.query_value("health"),
                 date_from=self.query_value("date_from"), date_to=self.query_value("date_to"),
             )})
         if path == "/api/supplier/demand":
@@ -775,6 +881,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/admin/suppliers":
             return self.protected("admin", lambda: self.manager.create_supplier(str(self.read_json(8192).get("name", ""))))
+        if path == "/api/admin/supplies/health-check":
+            return self.protected("admin", lambda: self.manager.check_supplier_accounts_health("admin"))
         prefix = "/api/admin/suppliers/"
         suffix = "/rotate-key"
         if path.startswith(prefix) and path.endswith(suffix) and path[len(prefix):-len(suffix)].isdigit():
