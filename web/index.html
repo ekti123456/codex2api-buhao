@@ -125,7 +125,7 @@
         <section class="panel api-guide">
           <div class="panel-head"><div><h2>供应商 API 接入</h2><p>网页登录使用的供应商密钥也可直接调用 API；密钥放在请求头，不要放进 URL。</p></div></div>
           <div class="api-steps">
-            <div><span class="logic-index">01</span><strong>查询实际缺口</strong><p>读取 demands，选择 accepting=true 的策略，并以 needed 作为本次最多提交数量。</p></div>
+            <div><span class="logic-index">01</span><strong>查询实际缺口</strong><p>读取服务端账号快照中的 demands，选择 accepting=true 的策略，并以 needed 作为本次最多提交数量；updated_at 是快照时间。</p></div>
             <div><span class="logic-index">02</span><strong>按数量提交 RT</strong><p>将返回的 group_id 原样提交；refresh_tokens 支持用换行分隔多个 RT。</p></div>
             <div><span class="logic-index">03</span><strong>根据结果继续</strong><p>accepted 是成功数，failed 是拒绝数；提交后再次查询缺口，不要自行猜测数量。</p></div>
           </div>
@@ -138,6 +138,6 @@
       </section>
     </main>
   </div>
-  <script src="/app.js?v=8" defer></script>
+  <script src="/app.js?v=9" defer></script>
 </body>
 </html>

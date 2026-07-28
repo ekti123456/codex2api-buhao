@@ -279,7 +279,8 @@ async function loadSupplier() {
   state.directImportEnabled = data.direct_import_enabled;
   hide("adminView"); show("supplierView");
   $("connectionState").textContent = "供应商会话";
-  $("supplierModeText").textContent = data.direct_import_enabled ? "管理员已开启直接补号。" : "管理员尚未开启直接补号，目前只能查看需求。";
+  const snapshotTime = data.updated_at ? new Date(data.updated_at).toLocaleString() : "等待首次同步";
+  $("supplierModeText").textContent = `${data.direct_import_enabled ? "管理员已开启直接补号。" : "管理员尚未开启直接补号，目前只能查看需求。"} 账号快照：${snapshotTime}`;
   $("demandGrid").innerHTML = data.demands.length ? data.demands.map((item) => `<article class="demand-card"><div class="demand-top"><span class="group-name"><i class="group-dot" style="--group-color:${esc(item.color || "#777")}"></i>检查：${esc(item.group_name)}</span><span class="state-badge ${item.accepting ? "triggered" : "disabled"}">${esc(item.status_text || (item.accepting ? "可提交" : "暂不可提交"))}</span></div><div class="demand-number">${item.needed}</div><span class="subtext">需要补充的存活账号</span><ul>${(item.reasons || []).map((reason) => `<li>${esc(reason)}</li>`).join("")}</ul>${item.note ? `<p class="subtext">备注：${esc(item.note)}</p>` : ""}</article>`).join("") : `<div class="empty">当前没有已启用的补号策略</div>`;
   $("supplyGroup").innerHTML = data.demands.map((item) => `<option value="${item.group_id}">${esc(item.group_name)} · 需要 ${item.needed} · ${esc(item.status_text || (item.accepting ? "可提交" : "暂不可提交"))}</option>`).join("");
   const selected = data.demands.find((item) => item.group_id === previousGroupId) || data.demands.find((item) => item.accepting) || data.demands[0];

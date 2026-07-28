@@ -80,6 +80,8 @@ Compose 默认使用名为 `pool-manager-data` 的 Docker 卷，避免宿主机 
 
 供应商登录网页后可在“供应商 API 接入”区域查看当前站点的完整 cURL 示例并一键复制。API 无需先创建网页会话，使用管理员创建的同一密钥即可查询实际缺口：
 
+需求接口只读取服务端账号快照，不会在每次调用时请求 Codex2API。快照会在服务启动时预热，并与定时/手动验活同步刷新；返回的 `updated_at` 表示快照生成时间。补号写入完成后缓存会失效，下一次查询会重新建立最新快照。
+
 ```bash
 curl https://pool-manager.example.com/api/supplier/v1/demand \
   -H 'X-Supplier-Key: sup_xxx'

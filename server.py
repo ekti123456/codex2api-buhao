@@ -105,7 +105,9 @@ class Manager:
         self.lock = threading.RLock()
         self.supply_lock = threading.Lock()
         self.health_check_lock = threading.Lock()
+        self.pool_refresh_lock = threading.Lock()
         self.health_schedule_wakeup = threading.Event()
+        self.pool_snapshot: dict[str, Any] | None = None
         self.sessions: dict[str, dict[str, Any]] = {}
         self.login_attempts: dict[str, dict[str, Any]] = {}
         self._init_database()
@@ -411,8 +413,8 @@ class Manager:
         if role not in {"admin", "system", "test"}:
             raise ValueError("验活角色无效")
         with self.health_check_lock:
-            payload = self.upstream("GET", "/api/admin/accounts")
-            accounts = {int(item["id"]): item for item in payload.get("accounts", []) if item.get("id") is not None}
+            _, account_list = self.fetch_pool()
+            accounts = {int(item["id"]): item for item in account_list if item.get("id") is not None}
             now = iso_now()
             with self.db() as db:
                 rows = db.execute("SELECT id,upstream_account_id FROM supplied_accounts WHERE status='accepted' AND upstream_account_id IS NOT NULL").fetchall()
@@ -441,7 +443,10 @@ class Manager:
                 f"供应商账号验活：共 {checked}，存活 {alive}，不可用 {unavailable}，未找到 {missing}",
                 count=checked,
             )
-            return {"ok": True, "checked": checked, "alive": alive, "unavailable": unavailable, "missing": missing, "checked_at": now}
+            return {
+                "ok": True, "checked": checked, "alive": alive, "unavailable": unavailable,
+                "missing": missing, "checked_at": now, "snapshot_updated_at": self.pool_snapshot_updated_at(),
+            }
 
     def remove_session(self, token: str) -> None:
         with self.lock:
@@ -480,27 +485,56 @@ class Manager:
             raise RuntimeError(f"Codex2API 请求失败: {error}") from error
         return json.loads(payload) if payload else {}
 
-    def fetch_pool(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        results: dict[str, Any] = {}
-        errors: list[Exception] = []
+    def fetch_pool(self, reuse_cache_after_wait: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        with self.pool_refresh_lock:
+            if reuse_cache_after_wait:
+                with self.lock:
+                    snapshot = json.loads(json.dumps(self.pool_snapshot, ensure_ascii=False)) if self.pool_snapshot else None
+                if snapshot:
+                    return list(snapshot["groups"]), list(snapshot["accounts"])
+            results: dict[str, Any] = {}
+            errors: list[Exception] = []
 
-        def load(key: str, path: str) -> None:
-            try:
-                results[key] = self.upstream("GET", path)
-            except Exception as error:  # noqa: BLE001 - surfaced to API
-                errors.append(error)
+            def load(key: str, path: str) -> None:
+                try:
+                    results[key] = self.upstream("GET", path)
+                except Exception as error:  # noqa: BLE001 - surfaced to API
+                    errors.append(error)
 
-        threads = [
-            threading.Thread(target=load, args=("groups", "/api/admin/account-groups")),
-            threading.Thread(target=load, args=("accounts", "/api/admin/accounts")),
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        if errors:
-            raise errors[0]
-        return list(results["groups"].get("groups", [])), list(results["accounts"].get("accounts", []))
+            threads = [
+                threading.Thread(target=load, args=("groups", "/api/admin/account-groups")),
+                threading.Thread(target=load, args=("accounts", "/api/admin/accounts")),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            if errors:
+                raise errors[0]
+            groups = list(results["groups"].get("groups", []))
+            accounts = list(results["accounts"].get("accounts", []))
+            self.store_pool_snapshot(groups, accounts)
+            return groups, accounts
+
+    def store_pool_snapshot(self, groups: list[dict[str, Any]], accounts: list[dict[str, Any]]) -> None:
+        snapshot = {"groups": groups, "accounts": accounts, "updated_at": iso_now()}
+        with self.lock:
+            self.pool_snapshot = json.loads(json.dumps(snapshot, ensure_ascii=False))
+
+    def cached_pool(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        with self.lock:
+            snapshot = json.loads(json.dumps(self.pool_snapshot, ensure_ascii=False)) if self.pool_snapshot else None
+        if snapshot:
+            return list(snapshot["groups"]), list(snapshot["accounts"])
+        return self.fetch_pool(reuse_cache_after_wait=True)
+
+    def pool_snapshot_updated_at(self) -> str | None:
+        with self.lock:
+            return str(self.pool_snapshot["updated_at"]) if self.pool_snapshot else None
+
+    def invalidate_pool_snapshot(self) -> None:
+        with self.lock:
+            self.pool_snapshot = None
 
     def evaluate(self, groups: list[dict[str, Any]], accounts: list[dict[str, Any]], settings: dict[str, Any]) -> list[dict[str, Any]]:
         policies = {int(item["group_id"]): item for item in settings["groups"]}
@@ -570,7 +604,7 @@ class Manager:
         }
 
     def supplier_demand(self) -> dict[str, Any]:
-        groups, accounts = self.fetch_pool()
+        groups, accounts = self.cached_pool()
         settings = self.settings_snapshot()
         settings["groups"] = reconcile_policies(settings["groups"], groups)
         evaluations = self.evaluate(groups, accounts, settings)
@@ -594,7 +628,10 @@ class Manager:
                 "state": state, "status_text": status_text, "cooldown_until": item["cooldown_until"],
                 "reasons": item["reasons"], "note": item["policy"].get("supplier_note", ""),
             })
-        return {"demands": demands, "direct_import_enabled": settings["global"]["supplier_auto_import"], "updated_at": iso_now()}
+        return {
+            "demands": demands, "direct_import_enabled": settings["global"]["supplier_auto_import"],
+            "updated_at": self.pool_snapshot_updated_at() or iso_now(), "cached": True,
+        }
 
     def start_monitor(self) -> None:
         def monitor() -> None:
@@ -608,7 +645,7 @@ class Manager:
                     continue
                 last_check = time.time()
                 try:
-                    groups, accounts = self.fetch_pool()
+                    groups, accounts = self.cached_pool()
                     settings["groups"] = reconcile_policies(settings["groups"], groups)
                     active = [(item["group_id"], item["recommended_count"]) for item in self.evaluate(groups, accounts, settings) if item["triggered"]]
                     signature = hashlib.sha256(json.dumps(active).encode()).hexdigest()
@@ -621,12 +658,15 @@ class Manager:
         threading.Thread(target=monitor, name="pool-demand-monitor", daemon=True).start()
 
         def health_monitor() -> None:
+            run_immediately = True
             while True:
-                interval_minutes = max(1, int(self.settings_snapshot()["global"]["account_health_interval_minutes"]))
-                wait_seconds = seconds_until_interval_boundary(time.time(), interval_minutes)
-                if self.health_schedule_wakeup.wait(wait_seconds):
-                    self.health_schedule_wakeup.clear()
-                    continue
+                if not run_immediately:
+                    interval_minutes = max(1, int(self.settings_snapshot()["global"]["account_health_interval_minutes"]))
+                    wait_seconds = seconds_until_interval_boundary(time.time(), interval_minutes)
+                    if self.health_schedule_wakeup.wait(wait_seconds):
+                        self.health_schedule_wakeup.clear()
+                        continue
+                run_immediately = False
                 try:
                     self.check_supplier_accounts_health("system")
                 except Exception as error:  # noqa: BLE001
@@ -636,7 +676,11 @@ class Manager:
 
     def supply(self, supplier_id: int, group_id: int, token_text: str, proxy_url: str) -> dict[str, Any]:
         with self.supply_lock:
-            return self._supply_locked(supplier_id, group_id, token_text, proxy_url)
+            try:
+                return self._supply_locked(supplier_id, group_id, token_text, proxy_url)
+            finally:
+                # 补号可能新增、删除或改组账号；下一次 demand 必须重新建立快照。
+                self.invalidate_pool_snapshot()
 
     def _supply_locked(self, supplier_id: int, group_id: int, token_text: str, proxy_url: str) -> dict[str, Any]:
         settings = self.settings_snapshot()

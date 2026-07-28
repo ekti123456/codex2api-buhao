@@ -163,6 +163,8 @@ class ManagerLogicTests(unittest.TestCase):
 
         def upstream(method, path, body=None):
             calls.append((method, path))
+            if path == "/api/admin/account-groups":
+                return {"groups": [{"id": 1, "name": "PLUS"}]}
             return {"accounts": [
                 {"id": 11, "status": "active", "health_tier": "healthy", "enabled": True, "locked": True},
                 {"id": 12, "status": "active", "enabled": False},
@@ -171,13 +173,51 @@ class ManagerLogicTests(unittest.TestCase):
         manager.upstream = upstream
         result = manager.check_supplier_accounts_health("test")
         self.assertEqual({"checked": 3, "alive": 1, "unavailable": 1, "missing": 1}, {key: result[key] for key in ("checked", "alive", "unavailable", "missing")})
-        self.assertEqual([("GET", "/api/admin/accounts")], calls)
+        self.assertEqual(1, calls.count(("GET", "/api/admin/account-groups")))
+        self.assertEqual(1, calls.count(("GET", "/api/admin/accounts")))
         alive = manager.supply_history(health="alive")
         self.assertEqual([11], [item["upstream_account_id"] for item in alive])
         self.assertGreaterEqual(alive[0]["alive_minutes"], 65)
         self.assertTrue(alive[0]["health_alive"])
         unavailable = manager.supply_history(health="unavailable")
         self.assertEqual({12, 13}, {item["upstream_account_id"] for item in unavailable})
+
+    def test_supplier_demand_uses_health_snapshot_cache(self):
+        manager = self.make_manager()
+        settings = default_settings()
+        settings["global"]["supplier_auto_import"] = True
+        settings["groups"] = [{
+            "group_id": 1, "enabled": True, "target_usable_count": 2, "min_usable_count": 2,
+            "min_remaining_7d_percent": 25, "trigger_on_usable": True,
+            "trigger_on_remaining_7d": False, "target_group_ids": [1], "supplier_note": "",
+        }]
+        manager.save_settings(settings)
+        calls = []
+        upstream_accounts = []
+
+        def upstream(method, path, body=None):
+            calls.append((method, path))
+            if path == "/api/admin/account-groups":
+                return {"groups": [{"id": 1, "name": "PLUS"}]}
+            return {"accounts": [dict(item) for item in upstream_accounts]}
+
+        manager.upstream = upstream
+        first = manager.supplier_demand()
+        self.assertEqual(2, first["demands"][0]["needed"])
+        upstream_accounts.extend([
+            {"id": 1, "status": "active", "group_ids": [1]},
+            {"id": 2, "status": "active", "group_ids": [1]},
+        ])
+        second = manager.supplier_demand()
+        self.assertEqual(2, second["demands"][0]["needed"])
+        self.assertEqual(first["updated_at"], second["updated_at"])
+        self.assertEqual(1, calls.count(("GET", "/api/admin/accounts")))
+
+        manager.check_supplier_accounts_health("test")
+        after_refresh_calls = len(calls)
+        third = manager.supplier_demand()
+        self.assertEqual(0, third["demands"][0]["needed"])
+        self.assertEqual(after_refresh_calls, len(calls))
 
     def test_supplier_demand_explains_cooldown_without_exposing_target_groups(self):
         manager = self.make_manager()
@@ -190,7 +230,7 @@ class ManagerLogicTests(unittest.TestCase):
         }]
         manager.save_settings(settings)
         manager.last_supply[4] = utc_now()
-        manager.fetch_pool = lambda: ([{"id": 4, "name": "PLUS池"}, {"id": 5, "name": "分流分组"}], [])
+        manager.cached_pool = lambda: ([{"id": 4, "name": "PLUS池"}, {"id": 5, "name": "分流分组"}], [])
         demand = manager.supplier_demand()["demands"][0]
         self.assertEqual("cooldown", demand["state"])
         self.assertEqual("冷却中", demand["status_text"])
