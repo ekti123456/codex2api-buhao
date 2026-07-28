@@ -194,6 +194,7 @@ class Manager:
             }.items():
                 if name not in supplied_columns:
                     db.execute(f"ALTER TABLE supplied_accounts ADD COLUMN {name} {definition}")
+            db.execute("UPDATE supplied_accounts SET health_last_alive_at=created_at WHERE status='accepted' AND health_last_alive_at IS NULL")
 
     def _load_settings(self) -> dict[str, Any]:
         with self.db() as db:

@@ -234,7 +234,8 @@ async function loadSupplies() {
       : item.health_alive === false
         ? `<span class="status-bad">${item.health_status === "not_found" ? "上游未找到" : "不可用"}</span><span class="subtext">${esc(item.health_status || "unknown")} · ${new Date(item.health_checked_at).toLocaleString()}</span>`
         : `<span class="subtext">等待首次定时验活</span>`;
-    return `<tr><td>${new Date(item.created_at).toLocaleString()}</td><td>${esc(item.supplier_name)}</td><td>${item.upstream_account_id ? `ID ${item.upstream_account_id}` : "未创建"}<span class="subtext">${esc(item.account_name || "")}</span></td><td>${esc(item.email || "-")}</td><td><span class="${item.status === "accepted" ? "status-ok" : "status-bad"}">${item.status === "accepted" ? "通过" : "拒绝"}</span>${item.error_message ? `<span class="subtext">${esc(item.error_message)}</span>` : ""}</td><td>${health}</td><td>${item.status === "accepted" ? esc(durationText(item.alive_minutes)) : "-"}</td><td>${item.target_group_ids.map((id) => esc(groupNames.get(Number(id)) || `ID ${id}`)).join(" + ")}</td></tr>`;
+    const aliveDuration = item.alive_minutes != null ? durationText(item.alive_minutes) : item.health_checked_at ? "未记录" : "待验活";
+    return `<tr><td>${new Date(item.created_at).toLocaleString()}</td><td>${esc(item.supplier_name)}</td><td>${item.upstream_account_id ? `ID ${item.upstream_account_id}` : "未创建"}<span class="subtext">${esc(item.account_name || "")}</span></td><td>${esc(item.email || "-")}</td><td><span class="${item.status === "accepted" ? "status-ok" : "status-bad"}">${item.status === "accepted" ? "通过" : "拒绝"}</span>${item.error_message ? `<span class="subtext">${esc(item.error_message)}</span>` : ""}</td><td>${health}</td><td>${item.status === "accepted" ? esc(aliveDuration) : "-"}</td><td>${item.target_group_ids.map((id) => esc(groupNames.get(Number(id)) || `ID ${id}`)).join(" + ")}</td></tr>`;
   }).join("") : `<tr><td colspan="8" class="empty">没有符合筛选条件的补号账号</td></tr>`;
 }
 
