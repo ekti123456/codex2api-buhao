@@ -9,8 +9,7 @@ RUN mkdir -p /app/data && chown -R app:app /app
 USER app
 ENV POOL_MANAGER_HOST=0.0.0.0 \
     POOL_MANAGER_PORT=8790 \
-    POOL_MANAGER_SETTINGS_FILE=/app/data/settings.json \
-    POOL_MANAGER_AUDIT_FILE=/app/data/audit.jsonl
+    POOL_MANAGER_DATABASE_FILE=/app/data/pool-manager.sqlite3
 EXPOSE 8790
 VOLUME ["/app/data"]
 CMD ["python", "server.py"]

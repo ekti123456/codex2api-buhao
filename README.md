@@ -5,12 +5,13 @@ Codex2API 的独立补号跳板。它解决静态网页无法安全保管 `X-Adm
 ## 已实现
 
 - 管理员密码登录、HttpOnly + SameSite 会话 Cookie、登录失败限速。
-- 管理员与供应商完全隔离的会话和页面。
+- 管理员创建独立供应商密钥，可随时启用/禁用；数据库只保存密钥哈希，明文只在创建时返回一次。
 - 服务端代理 Codex2API，只向供应商公开分组缺口，不公开账号列表、邮箱、用量明细或管理密钥。
-- 每个分组独立设置目标可用数、可用账号阈值、7d 剩余额度阈值和触发条件。
+- 每条策略将“检查分组”和“补号目标分组”分离：可检查 Plus，并把合格新账号同时加入 Plus、分流等多个分组。
 - `任一条件触发` / `全部条件触发`、补号冷却、单次补号上限。
 - 供应商直补默认关闭；管理员显式开启后，供应商才能提交 Refresh Token。
-- 新版 Codex2API 直接使用 `group_ids`；旧版响应不含 `bound_groups` 时，自动定位本次新账号并逐个调用 scheduler 接口绑定分组。
+- 每个 RT 单独导入，随后重新读取账号状态；只有账号为 active/ready 且确认进入全部目标分组才计入成功。
+- SQLite 持久化策略、供应商密钥哈希、供应商补号账号和审计记录；不保存 RT、上游管理密钥或登录密码。
 - 审计日志不记录 Token、密码或 Codex2API 管理密钥。
 - 后台按设置的评估间隔监测需求变化，不会自动凭空创建账号。
 
@@ -39,7 +40,7 @@ Codex2API 的独立补号跳板。它解决静态网页无法安全保管 `X-Adm
 $env:CODEX2API_BASE_URL='https://your-codex2api.example.com'
 $env:CODEX2API_ADMIN_KEY='你的管理密钥'
 $env:POOL_MANAGER_ADMIN_PASSWORD='管理员长密码'
-$env:POOL_MANAGER_SUPPLIER_PASSWORD='供应商长密码'
+$env:POOL_MANAGER_DATABASE_FILE='.\data\pool-manager.sqlite3'
 python server.py
 ```
 
@@ -62,11 +63,31 @@ docker compose up -d --build
 
 - 设置 `POOL_MANAGER_SECURE_COOKIE=true`；
 - 只让反向代理访问 8790，不直接暴露服务端口；
-- 管理员和供应商使用不同的随机长密码；
+- 管理员登录后为每个供应商创建独立密钥；
 - 定期轮换 `CODEX2API_ADMIN_KEY`；
 - 将 `/app/data` 挂载到权限受控的持久卷；
 - 限制供应商入口的来源 IP 或再加一层 Cloudflare Access / VPN；
-- 不要把供应商密码放进 URL、聊天消息或前端代码。
+- 不要把供应商密钥放进 URL、聊天消息或前端代码。
+
+## 供应商 API
+
+供应商无需先创建网页会话，使用管理员创建的密钥即可查询实际缺口：
+
+```bash
+curl https://pool-manager.example.com/api/supplier/v1/demand \
+  -H 'X-Supplier-Key: sup_xxx'
+```
+
+返回 `needed` 后，只提交对应数量的 RT：
+
+```bash
+curl -X POST https://pool-manager.example.com/api/supplier/v1/supply \
+  -H 'X-Supplier-Key: sup_xxx' \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id":1,"refresh_tokens":"rt_one\nrt_two","proxy_url":""}'
+```
+
+响应中的 `accepted` 是通过刷新、存活状态和全部目标分组三重校验的数量；失败账号不会计入补号成功，供应商可重新查询剩余缺口再补。
 
 ## 风险边界
 
@@ -76,4 +97,4 @@ docker compose up -d --build
 - 受 `max_accounts_per_run` 限制；
 - 补号后进入冷却期；
 - 每次操作写入审计日志；
-- Token 仅在请求过程中存在，不写入设置或审计文件。
+- Token 仅在请求过程中存在，不写入 SQLite、设置或审计记录。

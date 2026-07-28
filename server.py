@@ -7,6 +7,7 @@ import json
 import math
 import os
 import secrets
+import sqlite3
 import ssl
 import threading
 import time
@@ -32,9 +33,7 @@ class Config:
     base_url: str
     admin_key: str
     admin_password: str
-    supplier_password: str
-    settings_file: Path
-    audit_file: Path
+    database_file: Path
     secure_cookie: bool
     session_seconds: int
     http_timeout: int
@@ -45,13 +44,10 @@ class Config:
             "CODEX2API_BASE_URL": os.getenv("CODEX2API_BASE_URL", "").strip().rstrip("/"),
             "CODEX2API_ADMIN_KEY": os.getenv("CODEX2API_ADMIN_KEY", "").strip(),
             "POOL_MANAGER_ADMIN_PASSWORD": os.getenv("POOL_MANAGER_ADMIN_PASSWORD", ""),
-            "POOL_MANAGER_SUPPLIER_PASSWORD": os.getenv("POOL_MANAGER_SUPPLIER_PASSWORD", ""),
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise RuntimeError("缺少环境变量: " + ", ".join(missing))
-        if hmac.compare_digest(required["POOL_MANAGER_ADMIN_PASSWORD"], required["POOL_MANAGER_SUPPLIER_PASSWORD"]):
-            raise RuntimeError("管理员密码和供应商密码不能相同")
         upstream_url = urllib.parse.urlsplit(required["CODEX2API_BASE_URL"])
         if upstream_url.scheme not in {"http", "https"} or not upstream_url.netloc:
             raise RuntimeError("CODEX2API_BASE_URL 必须是完整的 http/https 地址")
@@ -61,9 +57,7 @@ class Config:
             base_url=required["CODEX2API_BASE_URL"],
             admin_key=required["CODEX2API_ADMIN_KEY"],
             admin_password=required["POOL_MANAGER_ADMIN_PASSWORD"],
-            supplier_password=required["POOL_MANAGER_SUPPLIER_PASSWORD"],
-            settings_file=Path(os.getenv("POOL_MANAGER_SETTINGS_FILE", str(ROOT / "data" / "settings.json"))),
-            audit_file=Path(os.getenv("POOL_MANAGER_AUDIT_FILE", str(ROOT / "data" / "audit.jsonl"))),
+            database_file=Path(os.getenv("POOL_MANAGER_DATABASE_FILE", str(ROOT / "data" / "pool-manager.sqlite3"))),
             secure_cookie=os.getenv("POOL_MANAGER_SECURE_COOKIE", "false").lower() == "true",
             session_seconds=int(os.getenv("POOL_MANAGER_SESSION_HOURS", "12")) * 3600,
             http_timeout=int(os.getenv("POOL_MANAGER_HTTP_TIMEOUT_SECONDS", "30")),
@@ -97,17 +91,88 @@ class Manager:
     def __init__(self, config: Config):
         self.config = config
         self.lock = threading.RLock()
+        self.supply_lock = threading.Lock()
         self.sessions: dict[str, dict[str, Any]] = {}
         self.login_attempts: dict[str, dict[str, Any]] = {}
+        self._init_database()
         self.settings = self._load_settings()
-        self.audit: list[dict[str, Any]] = []
         self.last_supply: dict[int, datetime] = {}
         self._load_audit()
 
+    def db(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.config.database_file, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA journal_mode=WAL")
+        return connection
+
+    def _init_database(self) -> None:
+        self.config.database_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.db() as db:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS suppliers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    key_hash TEXT NOT NULL UNIQUE,
+                    key_prefix TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS supply_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+                    check_group_id INTEGER NOT NULL,
+                    target_group_ids_json TEXT NOT NULL,
+                    requested_count INTEGER NOT NULL,
+                    submitted_count INTEGER NOT NULL DEFAULT 0,
+                    accepted_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS supplied_accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES supply_batches(id),
+                    supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+                    upstream_account_id INTEGER,
+                    account_name TEXT,
+                    email TEXT,
+                    status TEXT NOT NULL,
+                    target_group_ids_json TEXT NOT NULL,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    time TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    group_id INTEGER NOT NULL DEFAULT 0,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    supplier_id INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_supply_batches_supplier ON supply_batches(supplier_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_supplied_accounts_supplier ON supplied_accounts(supplier_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(id DESC);
+            """)
+
     def _load_settings(self) -> dict[str, Any]:
-        if not self.config.settings_file.exists():
-            return default_settings()
-        data = json.loads(self.config.settings_file.read_text("utf-8"))
+        with self.db() as db:
+            row = db.execute("SELECT value_json FROM app_settings WHERE key='settings'").fetchone()
+        if not row:
+            data = default_settings()
+            with self.db() as db:
+                db.execute("INSERT INTO app_settings(key,value_json,updated_at) VALUES('settings',?,?)", (json.dumps(data, ensure_ascii=False), iso_now()))
+            return data
+        data = json.loads(row["value_json"])
         validate_settings(data)
         return data
 
@@ -115,10 +180,8 @@ class Manager:
         validate_settings(value)
         value["version"] = 1
         value["updated_at"] = iso_now()
-        self.config.settings_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.config.settings_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), "utf-8")
-        os.replace(tmp, self.config.settings_file)
+        with self.db() as db:
+            db.execute("INSERT INTO app_settings(key,value_json,updated_at) VALUES('settings',?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at", (json.dumps(value, ensure_ascii=False), value["updated_at"]))
         with self.lock:
             self.settings = value
         self.append_audit("settings_updated", "admin", "补号策略已更新")
@@ -128,32 +191,25 @@ class Manager:
             return json.loads(json.dumps(self.settings))
 
     def _load_audit(self) -> None:
-        if not self.config.audit_file.exists():
-            return
-        for line in self.config.audit_file.read_text("utf-8").splitlines():
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            self.audit.append(entry)
-            if entry.get("event") == "supply_success" and entry.get("group_id"):
-                self.last_supply[int(entry["group_id"])] = datetime.fromisoformat(entry["time"].replace("Z", "+00:00"))
-        self.audit = self.audit[-500:]
+        with self.db() as db:
+            rows = db.execute("SELECT group_id, MAX(time) AS time FROM audit_log WHERE event='supply_success' AND group_id>0 GROUP BY group_id").fetchall()
+        for row in rows:
+            self.last_supply[int(row["group_id"])] = datetime.fromisoformat(str(row["time"]).replace("Z", "+00:00"))
 
-    def append_audit(self, event: str, role: str, message: str, group_id: int = 0, count: int = 0) -> None:
-        entry = {"time": iso_now(), "event": event, "role": role, "message": message, "group_id": group_id, "count": count}
-        with self.lock:
-            self.audit.append(entry)
-            self.audit = self.audit[-500:]
-        self.config.audit_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.config.audit_file.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    def append_audit(self, event: str, role: str, message: str, group_id: int = 0, count: int = 0, supplier_id: int | None = None) -> None:
+        with self.db() as db:
+            db.execute("INSERT INTO audit_log(time,event,role,message,group_id,count,supplier_id) VALUES(?,?,?,?,?,?,?)", (iso_now(), event, role, message, group_id, count, supplier_id))
 
-    def create_session(self, role: str) -> tuple[str, datetime]:
+    def audit_entries(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.db() as db:
+            rows = db.execute("SELECT time,event,role,message,group_id,count,supplier_id FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_session(self, role: str, supplier_id: int | None = None) -> tuple[str, datetime]:
         token = secrets.token_urlsafe(32)
         expires = utc_now() + timedelta(seconds=self.config.session_seconds)
         with self.lock:
-            self.sessions[token] = {"role": role, "expires": expires}
+            self.sessions[token] = {"role": role, "supplier_id": supplier_id, "expires": expires}
         return token, expires
 
     def session_role(self, token: str) -> str | None:
@@ -164,7 +220,92 @@ class Manager:
             if utc_now() >= session["expires"]:
                 self.sessions.pop(token, None)
                 return None
-            return str(session["role"])
+            role = str(session["role"])
+            supplier_id = session.get("supplier_id")
+        if role == "supplier":
+            with self.db() as db:
+                row = db.execute("SELECT enabled FROM suppliers WHERE id=?", (int(supplier_id or 0),)).fetchone()
+            if not row or not bool(row["enabled"]):
+                with self.lock:
+                    self.sessions.pop(token, None)
+                return None
+        return role
+
+    def session_context(self, token: str) -> dict[str, Any] | None:
+        if not self.session_role(token):
+            return None
+        with self.lock:
+            session = self.sessions.get(token)
+            return dict(session) if session else None
+
+    @staticmethod
+    def supplier_key_hash(raw_key: str) -> str:
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+    def create_supplier(self, name: str) -> dict[str, Any]:
+        name = name.strip()
+        if not name or len(name) > 100:
+            raise ValueError("供应商名称不能为空且最多 100 字")
+        raw_key = "sup_" + secrets.token_urlsafe(32)
+        now = iso_now()
+        with self.db() as db:
+            cursor = db.execute("INSERT INTO suppliers(name,key_hash,key_prefix,enabled,created_at) VALUES(?,?,?,?,?)", (name, self.supplier_key_hash(raw_key), raw_key[:12], 1, now))
+            supplier_id = int(cursor.lastrowid)
+        self.append_audit("supplier_created", "admin", f"创建供应商：{name}", supplier_id=supplier_id)
+        return {"id": supplier_id, "name": name, "key": raw_key, "key_prefix": raw_key[:12], "enabled": True, "created_at": now}
+
+    def authenticate_supplier(self, raw_key: str) -> dict[str, Any] | None:
+        if not raw_key:
+            return None
+        digest = self.supplier_key_hash(raw_key)
+        with self.db() as db:
+            row = db.execute("SELECT id,name,enabled FROM suppliers WHERE key_hash=?", (digest,)).fetchone()
+            if not row or not bool(row["enabled"]):
+                return None
+            db.execute("UPDATE suppliers SET last_used_at=? WHERE id=?", (iso_now(), int(row["id"])))
+        return {"id": int(row["id"]), "name": str(row["name"])}
+
+    def list_suppliers(self) -> list[dict[str, Any]]:
+        with self.db() as db:
+            rows = db.execute("""
+                SELECT s.id,s.name,s.key_prefix,s.enabled,s.created_at,s.last_used_at,
+                       COUNT(DISTINCT b.id) batch_count,COALESCE(SUM(b.accepted_count),0) accepted_count
+                FROM suppliers s LEFT JOIN supply_batches b ON b.supplier_id=s.id
+                GROUP BY s.id ORDER BY s.id DESC
+            """).fetchall()
+        return [{**dict(row), "enabled": bool(row["enabled"])} for row in rows]
+
+    def update_supplier(self, supplier_id: int, body: dict[str, Any]) -> dict[str, Any]:
+        fields, values = [], []
+        if "name" in body:
+            name = str(body["name"]).strip()
+            if not name or len(name) > 100:
+                raise ValueError("供应商名称不能为空且最多 100 字")
+            fields.append("name=?"); values.append(name)
+        if "enabled" in body:
+            fields.append("enabled=?"); values.append(1 if body["enabled"] else 0)
+        if not fields:
+            raise ValueError("没有可更新字段")
+        values.append(supplier_id)
+        with self.db() as db:
+            cursor = db.execute(f"UPDATE suppliers SET {','.join(fields)} WHERE id=?", values)
+            if not cursor.rowcount:
+                raise ValueError("供应商不存在")
+        self.append_audit("supplier_updated", "admin", f"更新供应商 ID {supplier_id}", supplier_id=supplier_id)
+        return {"ok": True}
+
+    def supply_history(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self.db() as db:
+            rows = db.execute("""
+                SELECT a.id,a.batch_id,a.supplier_id,s.name supplier_name,a.upstream_account_id,
+                       a.account_name,a.email,a.status,a.target_group_ids_json,a.error_message,a.created_at
+                FROM supplied_accounts a JOIN suppliers s ON s.id=a.supplier_id
+                ORDER BY a.id DESC LIMIT ?
+            """, (limit,)).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row); item["target_group_ids"] = json.loads(item.pop("target_group_ids_json")); output.append(item)
+        return output
 
     def remove_session(self, token: str) -> None:
         with self.lock:
@@ -287,7 +428,7 @@ class Manager:
         settings = self.settings_snapshot()
         settings["groups"] = reconcile_policies(settings["groups"], groups)
         return {
-            "connected": True, "base_url": self.config.base_url, "account_count": len(accounts), "groups": groups,
+            "connected": True, "account_count": len(accounts), "groups": groups,
             "settings": settings, "evaluations": self.evaluate(groups, accounts, settings),
             "supplier_auto_import": settings["global"]["supplier_auto_import"],
         }
@@ -297,9 +438,12 @@ class Manager:
         settings = self.settings_snapshot()
         settings["groups"] = reconcile_policies(settings["groups"], groups)
         evaluations = self.evaluate(groups, accounts, settings)
+        group_names = {int(group["id"]): str(group.get("name", group["id"])) for group in groups}
         demands = [{
             "group_id": item["group_id"], "group_name": item["group_name"], "color": item["color"],
             "needed": item["recommended_count"], "accepting": item["accepting_supply"], "reasons": item["reasons"],
+            "target_group_ids": item["policy"]["target_group_ids"],
+            "target_group_names": [group_names.get(group_id, f"ID {group_id}") for group_id in item["policy"]["target_group_ids"]],
             "note": item["policy"].get("supplier_note", ""),
         } for item in evaluations if item["policy"]["enabled"]]
         return {"demands": demands, "direct_import_enabled": settings["global"]["supplier_auto_import"], "updated_at": iso_now()}
@@ -328,7 +472,11 @@ class Manager:
 
         threading.Thread(target=monitor, name="pool-demand-monitor", daemon=True).start()
 
-    def supply(self, group_id: int, token_text: str, proxy_url: str) -> dict[str, Any]:
+    def supply(self, supplier_id: int, group_id: int, token_text: str, proxy_url: str) -> dict[str, Any]:
+        with self.supply_lock:
+            return self._supply_locked(supplier_id, group_id, token_text, proxy_url)
+
+    def _supply_locked(self, supplier_id: int, group_id: int, token_text: str, proxy_url: str) -> dict[str, Any]:
         settings = self.settings_snapshot()
         if not settings["global"]["supplier_auto_import"]:
             raise PermissionError("管理员尚未开启供应商直接补号")
@@ -342,29 +490,65 @@ class Manager:
         tokens = tokens[:limit]
         if not tokens:
             raise ValueError("没有有效 Token")
-        before = {int(item["id"]) for item in accounts}
-        name = f"supplier-{group_id}-{utc_now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
-        payload = {"name": name, "refresh_token": "\n".join(tokens), "proxy_url": proxy_url.strip(), "group_ids": [group_id]}
-        try:
-            upstream = self.upstream("POST", "/api/admin/accounts", payload)
-            if not upstream.get("bound_groups") and int(upstream.get("success", len(tokens)) or 0) > 0:
-                self._fallback_bind_new_accounts(before, group_id, name)
-        except Exception as error:
-            self.append_audit("supply_failed", "supplier", "上游新增失败", group_id, len(tokens))
-            print(f"supplier upstream error: {error}")
-            raise RuntimeError("上游新增失败，请联系管理员检查服务日志") from error
-        with self.lock:
-            self.last_supply[group_id] = utc_now()
-        self.append_audit("supply_success", "supplier", "供应商补号成功", group_id, len(tokens))
-        return {"ok": True, "submitted": len(tokens), "group_id": group_id, "message": str(upstream.get("message", ""))}
+        target_group_ids = [int(item) for item in selected["policy"]["target_group_ids"]]
+        now = iso_now()
+        with self.db() as db:
+            cursor = db.execute("INSERT INTO supply_batches(supplier_id,check_group_id,target_group_ids_json,requested_count,status,created_at) VALUES(?,?,?,?,?,?)", (supplier_id, group_id, json.dumps(target_group_ids), len(tokens), "processing", now))
+            batch_id = int(cursor.lastrowid)
 
-    def _fallback_bind_new_accounts(self, before: set[int], group_id: int, name_prefix: str) -> None:
-        _, accounts = self.fetch_pool()
-        new_accounts = [item for item in accounts if int(item["id"]) not in before and str(item.get("name", "")).startswith(name_prefix) and group_id not in (item.get("group_ids") or [])]
-        if not new_accounts:
-            raise RuntimeError("无法定位本次新增账号")
-        for item in new_accounts:
-            self.upstream("PATCH", f"/api/admin/accounts/{int(item['id'])}/scheduler", {"group_ids": [group_id]})
+        accepted = 0
+        failed = 0
+        results: list[dict[str, Any]] = []
+        known_ids = {int(item["id"]) for item in accounts}
+        for token in tokens:
+            account: dict[str, Any] | None = None
+            safe_error = ""
+            name = f"supply-{batch_id}-{secrets.token_hex(4)}"
+            try:
+                upstream = self.upstream("POST", "/api/admin/accounts", {"name": name, "refresh_token": token, "proxy_url": proxy_url.strip()})
+                if int(upstream.get("success", 0) or 0) != 1:
+                    raise ValueError("Refresh Token 无效或上游拒绝")
+                for attempt in range(4):
+                    payload = self.upstream("GET", "/api/admin/accounts")
+                    current = list(payload.get("accounts", []))
+                    account = next((item for item in current if int(item["id"]) not in known_ids and str(item.get("name", "")) == name), None)
+                    if account:
+                        known_ids.add(int(account["id"]))
+                        break
+                    if attempt < 3:
+                        time.sleep(0.5)
+                if not account:
+                    raise ValueError("新增后无法确认账号状态")
+                if not is_usable(account):
+                    raise ValueError(f"账号状态不可用：{account.get('status') or 'unknown'}")
+                self.upstream("PATCH", f"/api/admin/accounts/{int(account['id'])}/scheduler", {"group_ids": target_group_ids})
+                # 再读一次确认分组和存活状态，避免把仅“写入成功”的账号计作有效补号。
+                payload = self.upstream("GET", "/api/admin/accounts")
+                verified = next((item for item in payload.get("accounts", []) if int(item["id"]) == int(account["id"])), None)
+                if not verified or not is_usable(verified) or not set(target_group_ids).issubset(set(verified.get("group_ids") or [])):
+                    raise ValueError("账号存活或目标分组校验失败")
+                account = verified
+                accepted += 1
+                status = "accepted"
+            except Exception as error:  # noqa: BLE001 - detail only goes to server log
+                print(f"supplier account validation failed: {type(error).__name__}")
+                failed += 1
+                status = "rejected"
+                safe_error = "Refresh Token 无效、账号不可用或目标分组校验失败"
+            with self.db() as db:
+                db.execute("""INSERT INTO supplied_accounts(batch_id,supplier_id,upstream_account_id,account_name,email,status,target_group_ids_json,error_message,created_at)
+                              VALUES(?,?,?,?,?,?,?,?,?)""", (batch_id, supplier_id, int(account["id"]) if account else None, str(account.get("name", "")) if account else name, str(account.get("email", "")) if account else "", status, json.dumps(target_group_ids), safe_error or None, iso_now()))
+            results.append({"status": status, "account_id": int(account["id"]) if account and status == "accepted" else None})
+
+        with self.db() as db:
+            db.execute("UPDATE supply_batches SET submitted_count=?,accepted_count=?,failed_count=?,status=?,completed_at=? WHERE id=?", (len(tokens), accepted, failed, "completed", iso_now(), batch_id))
+        if accepted:
+            with self.lock:
+                self.last_supply[group_id] = utc_now()
+            self.append_audit("supply_success", "supplier", "供应商提交并通过存活校验", group_id, accepted, supplier_id)
+        if failed:
+            self.append_audit("supply_rejected", "supplier", "部分账号未通过存活校验", group_id, failed, supplier_id)
+        return {"ok": True, "batch_id": batch_id, "requested": len(tokens), "accepted": accepted, "failed": failed, "needed_before": limit, "group_id": group_id, "target_group_ids": target_group_ids, "results": results}
 
 
 def validate_settings(data: dict[str, Any]) -> None:
@@ -385,6 +569,11 @@ def validate_settings(data: dict[str, Any]) -> None:
         bounded(policy.get("min_remaining_7d_percent"), 0, 100, "7d 剩余额度阈值")
         if len(str(policy.get("supplier_note", ""))) > 500:
             raise ValueError("供应商备注过长")
+        targets = policy.get("target_group_ids")
+        if not isinstance(targets, list) or not targets or len(targets) > 20:
+            raise ValueError("补号目标分组必须包含 1..20 个分组")
+        if any(int(item) <= 0 for item in targets) or len({int(item) for item in targets}) != len(targets):
+            raise ValueError("补号目标分组 ID 无效或重复")
 
 
 def bounded(value: Any, low: float, high: float, label: str) -> None:
@@ -402,13 +591,16 @@ def reconcile_policies(existing: list[dict[str, Any]], groups: list[dict[str, An
     for group in groups:
         group_id = int(group["id"])
         if group_id in by_id:
-            output.append(by_id[group_id])
+            policy = by_id[group_id]
+            policy.setdefault("target_group_ids", [group_id])
+            output.append(policy)
             continue
         target = max(int(group.get("member_count") or 0), 10)
         output.append({
             "group_id": group_id, "enabled": False, "target_usable_count": target,
             "min_usable_count": max(1, math.ceil(target * 0.8)), "min_remaining_7d_percent": 25,
-            "trigger_on_usable": True, "trigger_on_remaining_7d": True, "supplier_note": "",
+            "trigger_on_usable": True, "trigger_on_remaining_7d": True,
+            "target_group_ids": [group_id], "supplier_note": "",
         })
     return output
 
@@ -443,12 +635,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/admin/bootstrap":
             return self.protected("admin", lambda: self.manager.bootstrap())
         if path == "/api/admin/audit":
-            def audit() -> dict[str, Any]:
-                with self.manager.lock:
-                    return {"entries": list(reversed(self.manager.audit[-100:]))}
-            return self.protected("admin", audit)
+            return self.protected("admin", lambda: {"entries": self.manager.audit_entries()})
+        if path == "/api/admin/suppliers":
+            return self.protected("admin", lambda: {"suppliers": self.manager.list_suppliers()})
+        if path == "/api/admin/supplies":
+            return self.protected("admin", lambda: {"accounts": self.manager.supply_history()})
         if path == "/api/supplier/demand":
             return self.protected("supplier", lambda: self.manager.supplier_demand())
+        if path == "/api/supplier/v1/demand":
+            return self.supplier_api(lambda supplier: self.manager.supplier_demand())
         self.serve_static(path)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -468,11 +663,19 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
             return
+        if path == "/api/admin/suppliers":
+            return self.protected("admin", lambda: self.manager.create_supplier(str(self.read_json(8192).get("name", ""))))
         if path == "/api/supplier/supply":
             def supply() -> dict[str, Any]:
                 body = self.read_json(2 * 1024 * 1024)
-                return self.manager.supply(int(body.get("group_id", 0)), str(body.get("tokens", "")), str(body.get("proxy_url", "")))
+                context = self.manager.session_context(self.session_token()) or {}
+                return self.manager.supply(int(context.get("supplier_id") or 0), int(body.get("group_id", 0)), str(body.get("tokens", "")), str(body.get("proxy_url", "")))
             return self.protected("supplier", supply)
+        if path == "/api/supplier/v1/supply":
+            def api_supply(supplier: dict[str, Any]) -> dict[str, Any]:
+                body = self.read_json(2 * 1024 * 1024)
+                return self.manager.supply(int(supplier["id"]), int(body.get("group_id", 0)), str(body.get("refresh_tokens", body.get("tokens", ""))), str(body.get("proxy_url", "")))
+            return self.supplier_api(api_supply)
         self.json_response(404, {"error": "not found"})
 
     def do_PUT(self) -> None:  # noqa: N802
@@ -487,6 +690,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.protected("admin", save)
         self.json_response(404, {"error": "not found"})
 
+    def do_PATCH(self) -> None:  # noqa: N802
+        path = urllib.parse.urlsplit(self.path).path
+        if not self.valid_origin():
+            return self.json_response(403, {"error": "来源校验失败"})
+        prefix = "/api/admin/suppliers/"
+        if path.startswith(prefix) and path[len(prefix):].isdigit():
+            supplier_id = int(path[len(prefix):])
+            return self.protected("admin", lambda: self.manager.update_supplier(supplier_id, self.read_json(8192)))
+        self.json_response(404, {"error": "not found"})
+
     def login(self, role: str) -> None:
         ip = self.client_address[0]
         if not self.manager.login_allowed(ip):
@@ -495,14 +708,15 @@ class Handler(BaseHTTPRequestHandler):
             password = str(self.read_json(4096).get("password", ""))
         except ValueError:
             return self.json_response(400, {"error": "请求格式错误"})
-        expected = self.manager.config.supplier_password if role == "supplier" else self.manager.config.admin_password
-        if not hmac.compare_digest(password, expected):
+        supplier = self.manager.authenticate_supplier(password) if role == "supplier" else None
+        valid = bool(supplier) if role == "supplier" else hmac.compare_digest(password, self.manager.config.admin_password)
+        if not valid:
             self.manager.record_login_failure(ip)
             return self.json_response(401, {"error": "密码错误"})
         with self.manager.lock:
             self.manager.login_attempts.pop(ip, None)
-        token, expires = self.manager.create_session(role)
-        self.manager.append_audit("login", role, f"{role} 登录成功")
+        token, expires = self.manager.create_session(role, int(supplier["id"]) if supplier else None)
+        self.manager.append_audit("login", role, f"{role} 登录成功", supplier_id=int(supplier["id"]) if supplier else None)
         self.send_response(200)
         self.security_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -524,6 +738,23 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(502, {"error": str(error)})
         except Exception as error:  # noqa: BLE001
             self.json_response(500, {"error": f"服务内部错误: {error}"})
+
+    def supplier_api(self, action: Any) -> None:
+        raw_key = self.headers.get("X-Supplier-Key", "").strip()
+        supplier = self.manager.authenticate_supplier(raw_key)
+        if not supplier:
+            return self.json_response(401, {"error": "供应商密钥无效或已禁用"})
+        try:
+            self.json_response(200, action(supplier))
+        except PermissionError as error:
+            self.json_response(403, {"error": str(error)})
+        except ValueError as error:
+            self.json_response(409, {"error": str(error)})
+        except RuntimeError:
+            self.json_response(502, {"error": "上游服务暂时不可用"})
+        except Exception as error:  # noqa: BLE001
+            print(f"supplier api error: {error}")
+            self.json_response(500, {"error": "服务内部错误"})
 
     def read_json(self, limit: int) -> dict[str, Any]:
         try:
