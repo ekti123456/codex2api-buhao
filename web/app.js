@@ -146,12 +146,15 @@ async function loadSuppliers() {
 async function createSupplier() {
   const name = $("newSupplierName").value.trim();
   if (!name) return;
+  const button = $("createSupplier");
+  button.disabled = true; button.textContent = "创建中…";
   try {
     const result = await api("/api/admin/suppliers", { method: "POST", body: JSON.stringify({ name }) });
     $("supplierKeyReveal").textContent = `请立即复制（只显示一次）：${result.key}`;
     $("newSupplierName").value = "";
     await loadSuppliers();
   } catch (error) { $("supplierKeyReveal").textContent = error.message; }
+  finally { button.disabled = false; button.textContent = "创建供应商密钥"; }
 }
 
 async function loadSupplies() {

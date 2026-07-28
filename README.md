@@ -89,6 +89,8 @@ curl -X POST https://pool-manager.example.com/api/supplier/v1/supply \
 
 响应中的 `accepted` 是通过刷新、存活状态和全部目标分组三重校验的数量；失败账号不会计入补号成功，供应商可重新查询剩余缺口再补。
 
+上游添加接口可能先返回成功、账号随后仍处于 `refreshing`。本服务会在 `POOL_MANAGER_ACCOUNT_VERIFY_SECONDS`（默认 60 秒）内轮询；只有最终变为 `active/ready` 才接受，超时或失败会删除本次创建的账号，避免污染账号池。
+
 ## 风险边界
 
 供应商直补是写操作，因此默认关闭。开启后，已登录的供应商能够向当前确实存在缺口的分组提交账号，但仍受以下限制：

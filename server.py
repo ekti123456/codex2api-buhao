@@ -37,6 +37,7 @@ class Config:
     secure_cookie: bool
     session_seconds: int
     http_timeout: int
+    account_verify_seconds: int
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -61,6 +62,7 @@ class Config:
             secure_cookie=os.getenv("POOL_MANAGER_SECURE_COOKIE", "false").lower() == "true",
             session_seconds=int(os.getenv("POOL_MANAGER_SESSION_HOURS", "12")) * 3600,
             http_timeout=int(os.getenv("POOL_MANAGER_HTTP_TIMEOUT_SECONDS", "30")),
+            account_verify_seconds=max(5, min(300, int(os.getenv("POOL_MANAGER_ACCOUNT_VERIFY_SECONDS", "60")))),
         )
 
 
@@ -508,19 +510,26 @@ class Manager:
                 upstream = self.upstream("POST", "/api/admin/accounts", {"name": name, "refresh_token": token, "proxy_url": proxy_url.strip()})
                 if int(upstream.get("success", 0) or 0) != 1:
                     raise ValueError("Refresh Token 无效或上游拒绝")
-                for attempt in range(4):
+                verify_deadline = time.monotonic() + self.config.account_verify_seconds
+                while True:
                     payload = self.upstream("GET", "/api/admin/accounts")
                     current = list(payload.get("accounts", []))
-                    account = next((item for item in current if int(item["id"]) not in known_ids and str(item.get("name", "")) == name), None)
-                    if account:
+                    latest = next((item for item in current if str(item.get("name", "")) == name and ((account is None and int(item["id"]) not in known_ids) or (account is not None and int(item["id"]) == int(account["id"])))), None)
+                    if latest:
+                        account = latest
                         known_ids.add(int(account["id"]))
+                    if account and is_usable(account):
                         break
-                    if attempt < 3:
-                        time.sleep(0.5)
+                    status_value = str(account.get("status", "")).lower() if account else ""
+                    terminal = account and (account.get("enabled") is False or status_value in {"banned", "disabled", "error", "expired", "invalid"})
+                    remaining_wait = verify_deadline - time.monotonic()
+                    if terminal or remaining_wait <= 0:
+                        break
+                    time.sleep(min(2.0, remaining_wait))
                 if not account:
                     raise ValueError("新增后无法确认账号状态")
                 if not is_usable(account):
-                    raise ValueError(f"账号状态不可用：{account.get('status') or 'unknown'}")
+                    raise ValueError(f"账号在验证时限内未存活：{account.get('status') or 'unknown'}")
                 self.upstream("PATCH", f"/api/admin/accounts/{int(account['id'])}/scheduler", {"group_ids": target_group_ids})
                 # 再读一次确认分组和存活状态，避免把仅“写入成功”的账号计作有效补号。
                 payload = self.upstream("GET", "/api/admin/accounts")
@@ -535,6 +544,11 @@ class Manager:
                 failed += 1
                 status = "rejected"
                 safe_error = "Refresh Token 无效、账号不可用或目标分组校验失败"
+                if account:
+                    try:
+                        self.upstream("DELETE", f"/api/admin/accounts/{int(account['id'])}")
+                    except Exception as cleanup_error:  # noqa: BLE001
+                        print(f"supplier rejected account cleanup failed: {type(cleanup_error).__name__}")
             with self.db() as db:
                 db.execute("""INSERT INTO supplied_accounts(batch_id,supplier_id,upstream_account_id,account_name,email,status,target_group_ids_json,error_message,created_at)
                               VALUES(?,?,?,?,?,?,?,?,?)""", (batch_id, supplier_id, int(account["id"]) if account else None, str(account.get("name", "")) if account else name, str(account.get("email", "")) if account else "", status, json.dumps(target_group_ids), safe_error or None, iso_now()))
@@ -812,7 +826,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.security_headers()
         self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store" if candidate.suffix == ".html" else "public, max-age=3600")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)

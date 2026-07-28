@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>账号池补号中心</title>
-  <link rel="stylesheet" href="/app.css">
-  <link rel="stylesheet" href="/admin.css">
+  <link rel="stylesheet" href="/app.css?v=3">
+  <link rel="stylesheet" href="/admin.css?v=3">
 </head>
 <body>
   <div class="page-shell">
@@ -56,7 +56,7 @@
 
         <section class="panel">
           <div class="panel-head"><div><h2>供应商密钥</h2><p>管理员创建独立密钥；密钥只显示一次，可随时禁用。供应商网页和 API 使用同一密钥。</p></div></div>
-          <div class="supplier-admin-create"><input id="newSupplierName" maxlength="100" placeholder="供应商名称"><button class="button primary" id="createSupplier">创建供应商密钥</button><code id="supplierKeyReveal"></code></div>
+          <div class="supplier-admin-create"><input id="newSupplierName" maxlength="100" placeholder="供应商名称"><button class="button primary" id="createSupplier" type="button">创建供应商密钥</button><code id="supplierKeyReveal"></code></div>
           <div class="table-scroll"><table class="policy-table compact-table"><thead><tr><th>供应商</th><th>密钥前缀</th><th>状态</th><th>通过账号</th><th>最近使用</th><th>操作</th></tr></thead><tbody id="supplierRows"></tbody></table></div>
         </section>
 
@@ -107,6 +107,6 @@
       </section>
     </main>
   </div>
-  <script src="/app.js" defer></script>
+  <script src="/app.js?v=3" defer></script>
 </body>
 </html>

@@ -11,7 +11,7 @@ class ManagerLogicTests(unittest.TestCase):
         config = Config(
             host="127.0.0.1", port=0, base_url="https://example.invalid", admin_key="secret",
             admin_password="admin-password", database_file=temp / "pool.sqlite3",
-            secure_cookie=False, session_seconds=3600, http_timeout=1,
+            secure_cookie=False, session_seconds=3600, http_timeout=1, account_verify_seconds=5,
         )
         return Manager(config)
 
@@ -122,6 +122,40 @@ class ManagerLogicTests(unittest.TestCase):
         history = manager.supply_history()
         self.assertEqual("accepted", history[0]["status"])
         self.assertEqual([1, 2], history[0]["target_group_ids"])
+
+    def test_invalid_account_is_rejected_and_deleted(self):
+        manager = self.make_manager()
+        supplier = manager.create_supplier("供应商 C")
+        settings = default_settings()
+        settings["global"]["supplier_auto_import"] = True
+        settings["groups"] = [{
+            "group_id": 1, "enabled": True, "target_usable_count": 1, "min_usable_count": 1,
+            "min_remaining_7d_percent": 25, "trigger_on_usable": True,
+            "trigger_on_remaining_7d": False, "target_group_ids": [1], "supplier_note": "",
+        }]
+        manager.save_settings(settings)
+        accounts = []
+        deleted = []
+
+        def upstream(method, path, body=None):
+            if path == "/api/admin/account-groups":
+                return {"groups": [{"id": 1, "name": "Plus"}]}
+            if path == "/api/admin/accounts" and method == "GET":
+                return {"accounts": [dict(item) for item in accounts]}
+            if path == "/api/admin/accounts" and method == "POST":
+                accounts.append({"id": 20, "name": body["name"], "status": "error", "group_ids": []})
+                return {"success": 1}
+            if method == "DELETE":
+                deleted.append(int(path.rsplit("/", 1)[1]))
+                return {"message": "deleted"}
+            raise AssertionError((method, path))
+
+        manager.upstream = upstream
+        result = manager.supply(supplier["id"], 1, "expired-token", "")
+        self.assertEqual(0, result["accepted"])
+        self.assertEqual(1, result["failed"])
+        self.assertEqual([20], deleted)
+        self.assertEqual("rejected", manager.supply_history()[0]["status"])
 
 
 if __name__ == "__main__":
