@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>账号池补号中心</title>
   <link rel="stylesheet" href="/app.css?v=5">
-  <link rel="stylesheet" href="/admin.css?v=7">
+  <link rel="stylesheet" href="/admin.css?v=8">
 </head>
 <body>
   <div class="page-shell">
@@ -121,9 +121,23 @@
             </form>
           </section>
         </div>
+
+        <section class="panel api-guide">
+          <div class="panel-head"><div><h2>供应商 API 接入</h2><p>网页登录使用的供应商密钥也可直接调用 API；密钥放在请求头，不要放进 URL。</p></div></div>
+          <div class="api-steps">
+            <div><span class="logic-index">01</span><strong>查询实际缺口</strong><p>读取 demands，选择 accepting=true 的策略，并以 needed 作为本次最多提交数量。</p></div>
+            <div><span class="logic-index">02</span><strong>按数量提交 RT</strong><p>将返回的 group_id 原样提交；refresh_tokens 支持用换行分隔多个 RT。</p></div>
+            <div><span class="logic-index">03</span><strong>根据结果继续</strong><p>accepted 是成功数，failed 是拒绝数；提交后再次查询缺口，不要自行猜测数量。</p></div>
+          </div>
+          <div class="api-guide-grid">
+            <article class="api-example"><div class="api-example-head"><div><strong>查询补号需求</strong><span class="subtext">GET /api/supplier/v1/demand</span></div><button class="button ghost api-copy" type="button" data-copy-target="supplierDemandCurl">复制 cURL</button></div><pre><code id="supplierDemandCurl"></code></pre></article>
+            <article class="api-example"><div class="api-example-head"><div><strong>提交 Refresh Token</strong><span class="subtext">POST /api/supplier/v1/supply</span></div><button class="button ghost api-copy" type="button" data-copy-target="supplierSupplyCurl">复制 cURL</button></div><pre><code id="supplierSupplyCurl"></code></pre></article>
+          </div>
+          <div class="api-note"><strong>认证：</strong><code>X-Supplier-Key: sup_xxx</code><span>示例中的 <code>sup_xxx</code> 请替换为管理员发给你的供应商密钥；目标入组信息不会通过供应商 API 返回。</span></div>
+        </section>
       </section>
     </main>
   </div>
-  <script src="/app.js?v=7" defer></script>
+  <script src="/app.js?v=8" defer></script>
 </body>
 </html>

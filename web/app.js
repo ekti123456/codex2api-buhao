@@ -20,6 +20,18 @@ function durationText(minutes) {
 function show(id) { $(id).classList.remove("hidden"); }
 function hide(id) { $(id).classList.add("hidden"); }
 
+async function copyPlainText(value) {
+  try { await navigator.clipboard.writeText(value); return true; }
+  catch (_) {
+    const area = document.createElement("textarea");
+    area.value = value; area.setAttribute("readonly", "");
+    area.style.position = "fixed"; area.style.opacity = "0";
+    document.body.appendChild(area); area.select();
+    const copied = document.execCommand("copy"); area.remove();
+    return copied;
+  }
+}
+
 function configureLogin() {
   const supplier = state.role === "supplier";
   $("loginEyebrow").textContent = supplier ? "供应商入口" : "管理员入口";
@@ -273,7 +285,33 @@ async function loadSupplier() {
   const selected = data.demands.find((item) => item.group_id === previousGroupId) || data.demands.find((item) => item.accepting) || data.demands[0];
   if (selected) $("supplyGroup").value = String(selected.group_id);
   $("supplyGroup").disabled = data.demands.length === 0;
+  renderSupplierApiGuide();
   updateSupplierLimit();
+}
+
+function renderSupplierApiGuide() {
+  const base = location.origin;
+  $("supplierDemandCurl").textContent = [
+    "curl --request GET \\",
+    `  --url '${base}/api/supplier/v1/demand' \\`,
+    "  --header 'X-Supplier-Key: sup_xxx'"
+  ].join("\n");
+  $("supplierSupplyCurl").textContent = [
+    "curl --request POST \\",
+    `  --url '${base}/api/supplier/v1/supply' \\`,
+    "  --header 'X-Supplier-Key: sup_xxx' \\",
+    "  --header 'Content-Type: application/json' \\",
+    `  --data '{"group_id":1,"refresh_tokens":"rt_one\\nrt_two","proxy_url":""}'`
+  ].join("\n");
+}
+
+async function copyApiExample(event) {
+  const button = event.currentTarget;
+  const target = $(button.dataset.copyTarget);
+  if (!target) return;
+  const original = button.textContent;
+  button.textContent = await copyPlainText(target.textContent) ? "已复制" : "复制失败";
+  window.setTimeout(() => { button.textContent = original; }, 1600);
 }
 
 function updateSupplierLimit() {
@@ -306,4 +344,5 @@ $("checkSuppliesHealth").addEventListener("click", checkSuppliesHealth);
 $("applySupplyFilters").addEventListener("click", loadSupplies); $("resetSupplyFilters").addEventListener("click", resetSupplyFilters);
 $("applyAuditFilters").addEventListener("click", loadAudit); $("resetAuditFilters").addEventListener("click", resetAuditFilters);
 $("refreshSupplier").addEventListener("click", loadSupplier); $("supplyGroup").addEventListener("change", updateSupplierLimit); $("supplyTokens").addEventListener("input", updateSupplierLimit); $("supplyForm").addEventListener("submit", submitSupply);
+document.querySelectorAll(".api-copy").forEach((button) => button.addEventListener("click", copyApiExample));
 configureLogin(); enterApp();

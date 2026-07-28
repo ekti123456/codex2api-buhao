@@ -78,7 +78,7 @@ Compose 默认使用名为 `pool-manager-data` 的 Docker 卷，避免宿主机 
 
 ## 供应商 API
 
-供应商无需先创建网页会话，使用管理员创建的密钥即可查询实际缺口：
+供应商登录网页后可在“供应商 API 接入”区域查看当前站点的完整 cURL 示例并一键复制。API 无需先创建网页会话，使用管理员创建的同一密钥即可查询实际缺口：
 
 ```bash
 curl https://pool-manager.example.com/api/supplier/v1/demand \
