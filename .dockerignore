@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.env.*
+data
+__pycache__
+*.py[cod]
+test_*.py
+compose*.yml
+README.md

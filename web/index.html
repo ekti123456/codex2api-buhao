@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>账号池补号中心</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="账号池补号中心">
+        <span class="brand-mark">C2</span>
+        <span><strong>账号池补号中心</strong><small>安全跳板与库存策略</small></span>
+      </a>
+      <div class="top-actions hidden" id="topActions">
+        <span class="connection" id="connectionState">未连接</span>
+        <button class="button ghost" id="logoutButton">退出</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="auth-wrap" id="loginView">
+        <div class="auth-card">
+          <div class="eyebrow" id="loginEyebrow">管理员入口</div>
+          <h1 id="loginTitle">进入补号控制台</h1>
+          <p id="loginDescription">管理密钥只保存在服务端，浏览器仅获得安全会话。</p>
+          <form id="loginForm">
+            <label>访问密码<input type="password" id="loginPassword" required autocomplete="current-password" placeholder="输入访问密码"></label>
+            <button class="button primary block" type="submit">登录</button>
+          </form>
+          <p class="form-error" id="loginError" role="alert"></p>
+          <a class="portal-link" id="portalLink" href="/#supplier">前往供应商入口 →</a>
+        </div>
+      </section>
+
+      <section class="hidden" id="adminView">
+        <div class="page-heading">
+          <div><div class="eyebrow">管理员控制台</div><h1>库存与补号策略</h1><p>策略保存在跳板服务中，供应商看不到账号详情和 Codex2API 密钥。</p></div>
+          <div class="heading-actions"><button class="button" id="refreshAdmin">刷新状态</button><button class="button primary" id="saveSettings">保存设置</button></div>
+        </div>
+
+        <div class="metrics" id="adminMetrics"></div>
+
+        <section class="panel">
+          <div class="panel-head"><div><h2>全局设置</h2><p>决定策略多久评估一次、两次补号之间的间隔以及供应商权限。</p></div><span class="save-state" id="saveState"></span></div>
+          <div class="settings-grid">
+            <label>评估间隔（分钟）<input id="evaluationInterval" type="number" min="1" max="1440"></label>
+            <label>补号冷却（分钟）<input id="cooldownMinutes" type="number" min="0" max="10080"></label>
+            <label>单次补号上限<input id="maxPerRun" type="number" min="1" max="100"></label>
+            <label>条件组合<select id="triggerMode"><option value="any">任一条件触发</option><option value="all">全部条件触发</option></select></label>
+          </div>
+          <label class="danger-toggle"><input id="supplierAutoImport" type="checkbox"><span><strong>允许供应商直接补号</strong><small>开启后，供应商提交的 Token 会立即写入 Codex2API。默认关闭。</small></span></label>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><div><h2>分组目标</h2><p>“可用”指 active/ready、未禁用且健康档位不是 banned/error 的账号。</p></div></div>
+          <div class="table-scroll"><table class="policy-table"><thead><tr><th>启用</th><th>分组</th><th>当前</th><th>目标可用</th><th>可用阈值</th><th>7d 剩余额度阈值</th><th>触发条件</th><th>建议补充</th><th>供应商备注</th></tr></thead><tbody id="policyRows"></tbody></table></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><div><h2>判定说明</h2><p>避免只看账号个数：额度较低时也能按“可用容量”提前补号。</p></div></div>
+          <div class="logic-grid">
+            <div><span class="logic-index">01</span><strong>账号数量</strong><p>可用账号低于阈值时触发，补到“目标可用数量”。</p></div>
+            <div><span class="logic-index">02</span><strong>7d 剩余额度</strong><p>按每个账号的 100% − 7d 已用比例求平均；低于阈值时估算需要的新账号数。</p></div>
+            <div><span class="logic-index">03</span><strong>安全限速</strong><p>最终数量取两种缺口的较大值，并受冷却时间和单次上限约束。</p></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><div><h2>最近审计</h2><p>只记录操作类型、分组和数量，不记录 Token 或管理密钥。</p></div><button class="button ghost" id="refreshAudit">刷新</button></div>
+          <div class="audit-list" id="auditList"></div>
+        </section>
+      </section>
+
+      <section class="hidden" id="supplierView">
+        <div class="page-heading">
+          <div><div class="eyebrow">供应商入口</div><h1>当前补号需求</h1><p>这里只显示分组缺口；账号列表、用量明细和管理密钥不会下发。</p></div>
+          <button class="button" id="refreshSupplier">刷新需求</button>
+        </div>
+        <div class="supplier-layout">
+          <section class="panel"><div class="panel-head"><div><h2>需求列表</h2><p id="supplierModeText"></p></div></div><div class="demand-grid" id="demandGrid"></div></section>
+          <section class="panel supply-panel">
+            <div class="panel-head"><div><h2>提交 Refresh Token</h2><p>系统只接受当前缺口数量，超出的 Token 不会提交。</p></div></div>
+            <form id="supplyForm" class="supply-form">
+              <label>目标分组<select id="supplyGroup"></select></label>
+              <label>代理地址（可选）<input id="supplyProxy" placeholder="http://proxy.example.com:8080"></label>
+              <label>Refresh Token（每行一个）<textarea id="supplyTokens" rows="10" required placeholder="rt_...&#10;rt_..."></textarea></label>
+              <div class="token-summary"><span id="supplierTokenCount">0 个 Token</span><span id="supplierLimit">当前最多接收 0 个</span></div>
+              <button class="button primary block" id="submitSupply" type="submit">提交补号</button>
+              <p class="form-error" id="supplyMessage" role="status"></p>
+            </form>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
