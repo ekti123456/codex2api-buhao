@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = { role: location.hash === "#supplier" ? "supplier" : "admin", bootstrap: null, demands: [], directImportEnabled: false, lastSupplierKey: "" };
+const state = { role: location.hash === "#supplier" ? "supplier" : "admin", bootstrap: null, demands: [], suppliers: [], directImportEnabled: false, lastSupplierKey: "" };
 
 async function api(path, options = {}) {
   const response = await fetch(path, { credentials: "same-origin", ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
@@ -54,7 +54,8 @@ async function loadAdmin() {
   hide("supplierView"); show("adminView");
   $("connectionState").textContent = `已连接 · ${data.account_count} 个账号`;
   renderAdmin();
-  await Promise.all([loadAudit(), loadSuppliers(), loadSupplies()]);
+  await loadSuppliers();
+  await Promise.all([loadAudit(), loadSupplies()]);
 }
 
 function renderAdmin() {
@@ -130,13 +131,37 @@ async function saveSettings() {
 }
 
 async function loadAudit() {
-  const data = await api("/api/admin/audit");
-  $("auditList").innerHTML = data.entries.length ? data.entries.map((entry) => `<div class="audit-row"><time>${new Date(entry.time).toLocaleString()}</time><span>${esc(entry.event)}</span><div>${esc(entry.message)}</div><strong>${entry.count ? `${entry.count} 个` : ""}</strong></div>`).join("") : `<div class="empty">暂无审计记录</div>`;
+  const query = new URLSearchParams();
+  if ($("auditFilterSupplier").value) query.set("supplier_id", $("auditFilterSupplier").value);
+  if ($("auditFilterRole").value) query.set("role", $("auditFilterRole").value);
+  if ($("auditFilterEvent").value.trim()) query.set("event", $("auditFilterEvent").value.trim());
+  if ($("auditFilterFrom").value) query.set("date_from", $("auditFilterFrom").value);
+  if ($("auditFilterTo").value) query.set("date_to", $("auditFilterTo").value);
+  const data = await api(`/api/admin/audit${query.size ? `?${query}` : ""}`);
+  const supplierNames = new Map(state.suppliers.map((item) => [Number(item.id), item.name]));
+  $("auditList").innerHTML = data.entries.length ? data.entries.map((entry) => `<div class="audit-row"><time>${new Date(entry.time).toLocaleString()}</time><span>${esc(entry.event)}</span><div>${esc(entry.message)}${entry.supplier_id ? `<small class="subtext">供应商：${esc(supplierNames.get(Number(entry.supplier_id)) || `已删除 #${entry.supplier_id}`)}</small>` : ""}</div><strong>${entry.count ? `${entry.count} 个` : ""}</strong></div>`).join("") : `<div class="empty">没有符合筛选条件的审计记录</div>`;
 }
 
 async function loadSuppliers() {
   const data = await api("/api/admin/suppliers");
-  $("supplierRows").innerHTML = data.suppliers.length ? data.suppliers.map((item) => `<tr><td><strong>${esc(item.name)}</strong><span class="subtext">ID ${item.id} · ${new Date(item.created_at).toLocaleString()}</span></td><td><code>${esc(item.key_prefix)}…</code></td><td><span class="state-badge ${item.enabled ? "" : "disabled"}">${item.enabled ? "启用" : "已禁用"}</span></td><td>${item.accepted_count}</td><td>${item.last_used_at ? new Date(item.last_used_at).toLocaleString() : "从未"}</td><td><div class="heading-actions"><button class="button ghost supplier-toggle" type="button" data-id="${item.id}" data-enabled="${item.enabled}">${item.enabled ? "禁用" : "启用"}</button><button class="button ghost supplier-delete" type="button" data-id="${item.id}" data-name="${esc(item.name)}">删除</button></div></td></tr>`).join("") : `<tr><td colspan="6" class="empty">尚未创建供应商</td></tr>`;
+  state.suppliers = data.suppliers;
+  $("supplierRows").innerHTML = data.suppliers.length ? data.suppliers.map((item) => `<tr><td><strong>${esc(item.name)}</strong><span class="subtext">ID ${item.id} · ${new Date(item.created_at).toLocaleString()}</span></td><td><code>${esc(item.key_prefix)}…</code></td><td><span class="state-badge ${item.enabled ? "" : "disabled"}">${item.enabled ? "启用" : "已禁用"}</span></td><td>${item.accepted_count}</td><td>${item.last_used_at ? new Date(item.last_used_at).toLocaleString() : "从未"}</td><td><div class="heading-actions"><button class="button ghost supplier-rotate" type="button" data-id="${item.id}" data-name="${esc(item.name)}">重置并复制</button><button class="button ghost supplier-toggle" type="button" data-id="${item.id}" data-enabled="${item.enabled}">${item.enabled ? "禁用" : "启用"}</button><button class="button ghost supplier-delete" type="button" data-id="${item.id}" data-name="${esc(item.name)}">删除</button></div></td></tr>`).join("") : `<tr><td colspan="6" class="empty">尚未创建供应商</td></tr>`;
+  document.querySelectorAll(".supplier-rotate").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm(`确定重置供应商“${button.dataset.name}”的密钥？旧密钥和现有登录会立即失效。`)) return;
+    button.disabled = true; button.textContent = "重置中…";
+    try {
+      const result = await api(`/api/admin/suppliers/${button.dataset.id}/rotate-key`, { method: "POST", body: "{}" });
+      state.lastSupplierKey = result.key;
+      $("supplierKeyReveal").textContent = `新密钥（请交给供应商）：${result.key}`;
+      $("copySupplierKey").disabled = false;
+      $("copySupplierKey").textContent = "复制密钥";
+      await copySupplierKey();
+      await loadSuppliers();
+    } catch (error) {
+      $("supplierKeyReveal").textContent = error.message;
+      button.disabled = false; button.textContent = "重置并复制";
+    }
+  }));
   document.querySelectorAll(".supplier-toggle").forEach((button) => button.addEventListener("click", async () => {
     await api(`/api/admin/suppliers/${button.dataset.id}`, { method: "PATCH", body: JSON.stringify({ enabled: button.dataset.enabled !== "true" }) });
     await loadSuppliers();
@@ -146,6 +171,11 @@ async function loadSuppliers() {
     await api(`/api/admin/suppliers/${button.dataset.id}`, { method: "DELETE", body: "{}" });
     await loadSuppliers();
   }));
+  for (const id of ["supplyFilterSupplier", "auditFilterSupplier"]) {
+    const select = $(id); const previous = select.value;
+    select.innerHTML = `<option value="">全部供应商</option>${data.suppliers.map((item) => `<option value="${item.id}">${esc(item.name)}</option>`).join("")}`;
+    if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+  }
 }
 
 async function createSupplier() {
@@ -182,9 +212,24 @@ async function copySupplierKey() {
 }
 
 async function loadSupplies() {
-  const data = await api("/api/admin/supplies");
+  const query = new URLSearchParams();
+  if ($("supplyFilterSupplier").value) query.set("supplier_id", $("supplyFilterSupplier").value);
+  if ($("supplyFilterStatus").value) query.set("status", $("supplyFilterStatus").value);
+  if ($("supplyFilterFrom").value) query.set("date_from", $("supplyFilterFrom").value);
+  if ($("supplyFilterTo").value) query.set("date_to", $("supplyFilterTo").value);
+  const data = await api(`/api/admin/supplies${query.size ? `?${query}` : ""}`);
   const groupNames = new Map((state.bootstrap?.groups || []).map((item) => [Number(item.id), item.name]));
-  $("suppliedAccountRows").innerHTML = data.accounts.length ? data.accounts.map((item) => `<tr><td>${new Date(item.created_at).toLocaleString()}</td><td>${esc(item.supplier_name)}</td><td>${item.upstream_account_id ? `ID ${item.upstream_account_id}` : "未创建"}<span class="subtext">${esc(item.account_name || "")}</span></td><td>${esc(item.email || "-")}</td><td><span class="${item.status === "accepted" ? "status-ok" : "status-bad"}">${item.status === "accepted" ? "存活并已入组" : "拒绝"}</span>${item.error_message ? `<span class="subtext">${esc(item.error_message)}</span>` : ""}</td><td>${item.target_group_ids.map((id) => esc(groupNames.get(Number(id)) || `ID ${id}`)).join(" + ")}</td></tr>`).join("") : `<tr><td colspan="6" class="empty">暂无供应商补号记录</td></tr>`;
+  $("suppliedAccountRows").innerHTML = data.accounts.length ? data.accounts.map((item) => `<tr><td>${new Date(item.created_at).toLocaleString()}</td><td>${esc(item.supplier_name)}</td><td>${item.upstream_account_id ? `ID ${item.upstream_account_id}` : "未创建"}<span class="subtext">${esc(item.account_name || "")}</span></td><td>${esc(item.email || "-")}</td><td><span class="${item.status === "accepted" ? "status-ok" : "status-bad"}">${item.status === "accepted" ? "存活并已入组" : "拒绝"}</span>${item.error_message ? `<span class="subtext">${esc(item.error_message)}</span>` : ""}</td><td>${item.target_group_ids.map((id) => esc(groupNames.get(Number(id)) || `ID ${id}`)).join(" + ")}</td></tr>`).join("") : `<tr><td colspan="6" class="empty">没有符合筛选条件的补号账号</td></tr>`;
+}
+
+function resetSupplyFilters() {
+  for (const id of ["supplyFilterSupplier", "supplyFilterStatus", "supplyFilterFrom", "supplyFilterTo"]) $(id).value = "";
+  loadSupplies();
+}
+
+function resetAuditFilters() {
+  for (const id of ["auditFilterSupplier", "auditFilterRole", "auditFilterEvent", "auditFilterFrom", "auditFilterTo"]) $(id).value = "";
+  loadAudit();
 }
 
 async function loadSupplier() {
@@ -229,5 +274,7 @@ window.addEventListener("hashchange", () => location.reload());
 $("loginForm").addEventListener("submit", login); $("logoutButton").addEventListener("click", logout);
 $("refreshAdmin").addEventListener("click", loadAdmin); $("saveSettings").addEventListener("click", saveSettings); $("refreshAudit").addEventListener("click", loadAudit);
 $("createSupplier").addEventListener("click", createSupplier); $("copySupplierKey").addEventListener("click", copySupplierKey); $("refreshSupplies").addEventListener("click", loadSupplies);
+$("applySupplyFilters").addEventListener("click", loadSupplies); $("resetSupplyFilters").addEventListener("click", resetSupplyFilters);
+$("applyAuditFilters").addEventListener("click", loadAudit); $("resetAuditFilters").addEventListener("click", resetAuditFilters);
 $("refreshSupplier").addEventListener("click", loadSupplier); $("supplyGroup").addEventListener("change", updateSupplierLimit); $("supplyTokens").addEventListener("input", updateSupplierLimit); $("supplyForm").addEventListener("submit", submitSupply);
 configureLogin(); enterApp();

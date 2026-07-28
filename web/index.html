@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>账号池补号中心</title>
   <link rel="stylesheet" href="/app.css?v=5">
-  <link rel="stylesheet" href="/admin.css?v=5">
+  <link rel="stylesheet" href="/admin.css?v=6">
 </head>
 <body>
   <div class="page-shell">
@@ -55,7 +55,7 @@
         </section>
 
         <section class="panel">
-          <div class="panel-head"><div><h2>供应商密钥</h2><p>管理员创建独立密钥；密钥只显示一次，可随时禁用。供应商网页和 API 使用同一密钥。</p></div></div>
+          <div class="panel-head"><div><h2>供应商密钥</h2><p>密钥只保存哈希；忘记后可重置并复制新密钥，旧密钥会立即失效。供应商网页和 API 使用同一密钥。</p></div></div>
           <div class="supplier-admin-create"><input id="newSupplierName" maxlength="100" placeholder="供应商名称"><button class="button primary" id="createSupplier" type="button">创建供应商密钥</button><div class="key-reveal"><code id="supplierKeyReveal"></code><button class="button ghost" id="copySupplierKey" type="button" disabled>复制密钥</button></div></div>
           <div class="table-scroll"><table class="policy-table compact-table"><thead><tr><th>供应商</th><th>密钥前缀</th><th>状态</th><th>通过账号</th><th>最近使用</th><th>操作</th></tr></thead><tbody id="supplierRows"></tbody></table></div>
         </section>
@@ -67,6 +67,13 @@
 
         <section class="panel">
           <div class="panel-head"><div><h2>供应商补号账号</h2><p>查看账号由哪个供应商提交、是否通过存活校验，以及最终进入的目标分组。</p></div><button class="button ghost" id="refreshSupplies">刷新</button></div>
+          <div class="filter-bar">
+            <label>供应商<select id="supplyFilterSupplier"><option value="">全部供应商</option></select></label>
+            <label>结果<select id="supplyFilterStatus"><option value="">全部结果</option><option value="accepted">通过</option><option value="rejected">拒绝</option></select></label>
+            <label>开始日期<input id="supplyFilterFrom" type="date"></label>
+            <label>结束日期<input id="supplyFilterTo" type="date"></label>
+            <button class="button" id="applySupplyFilters" type="button">筛选</button><button class="button ghost" id="resetSupplyFilters" type="button">重置</button>
+          </div>
           <div class="table-scroll"><table class="policy-table compact-table"><thead><tr><th>时间</th><th>供应商</th><th>账号</th><th>邮箱</th><th>校验结果</th><th>目标分组</th></tr></thead><tbody id="suppliedAccountRows"></tbody></table></div>
         </section>
 
@@ -81,6 +88,14 @@
 
         <section class="panel">
           <div class="panel-head"><div><h2>最近审计</h2><p>只记录操作类型、分组和数量，不记录 Token 或管理密钥。</p></div><button class="button ghost" id="refreshAudit">刷新</button></div>
+          <div class="filter-bar">
+            <label>供应商<select id="auditFilterSupplier"><option value="">全部供应商</option></select></label>
+            <label>角色<select id="auditFilterRole"><option value="">全部角色</option><option value="admin">管理员</option><option value="supplier">供应商</option><option value="system">系统</option></select></label>
+            <label>事件<input id="auditFilterEvent" maxlength="100" placeholder="如 supply_success"></label>
+            <label>开始日期<input id="auditFilterFrom" type="date"></label>
+            <label>结束日期<input id="auditFilterTo" type="date"></label>
+            <button class="button" id="applyAuditFilters" type="button">筛选</button><button class="button ghost" id="resetAuditFilters" type="button">重置</button>
+          </div>
           <div class="audit-list" id="auditList"></div>
         </section>
       </section>
@@ -107,6 +122,6 @@
       </section>
     </main>
   </div>
-  <script src="/app.js?v=5" defer></script>
+  <script src="/app.js?v=6" defer></script>
 </body>
 </html>

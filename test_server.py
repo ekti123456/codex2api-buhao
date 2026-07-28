@@ -92,6 +92,54 @@ class ManagerLogicTests(unittest.TestCase):
         manager.delete_supplier(created["id"])
         self.assertEqual([], manager.list_suppliers())
 
+    def test_supplier_key_can_be_rotated_without_storing_plaintext(self):
+        manager = self.make_manager()
+        created = manager.create_supplier("供应商密钥轮换")
+        token, _ = manager.create_session("supplier", created["id"])
+        rotated = manager.rotate_supplier_key(created["id"])
+        self.assertNotEqual(created["key"], rotated["key"])
+        self.assertIsNone(manager.authenticate_supplier(created["key"]))
+        self.assertEqual(created["id"], manager.authenticate_supplier(rotated["key"])["id"])
+        self.assertIsNone(manager.session_role(token))
+        with manager.db() as db:
+            stored = db.execute("SELECT key_hash,key_prefix FROM suppliers WHERE id=?", (created["id"],)).fetchone()
+        self.assertNotEqual(rotated["key"], stored["key_hash"])
+        self.assertEqual(rotated["key"][:12], stored["key_prefix"])
+
+    def test_supply_and_audit_history_filters(self):
+        manager = self.make_manager()
+        first = manager.create_supplier("供应商甲")
+        second = manager.create_supplier("供应商乙")
+        with manager.db() as db:
+            first_batch = db.execute(
+                "INSERT INTO supply_batches(supplier_id,check_group_id,target_group_ids_json,requested_count,submitted_count,accepted_count,failed_count,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (first["id"], 1, "[1]", 1, 1, 1, 0, "completed", "2026-07-27T02:00:00Z"),
+            ).lastrowid
+            second_batch = db.execute(
+                "INSERT INTO supply_batches(supplier_id,check_group_id,target_group_ids_json,requested_count,submitted_count,accepted_count,failed_count,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (second["id"], 1, "[1]", 1, 1, 0, 1, "completed", "2026-07-28T02:00:00Z"),
+            ).lastrowid
+            db.execute(
+                "INSERT INTO supplied_accounts(batch_id,supplier_id,status,target_group_ids_json,created_at) VALUES(?,?,?,?,?)",
+                (first_batch, first["id"], "accepted", "[1]", "2026-07-27T02:00:00Z"),
+            )
+            db.execute(
+                "INSERT INTO supplied_accounts(batch_id,supplier_id,status,target_group_ids_json,created_at) VALUES(?,?,?,?,?)",
+                (second_batch, second["id"], "rejected", "[1]", "2026-07-28T02:00:00Z"),
+            )
+        manager.append_audit("supply_success", "supplier", "甲补号成功", supplier_id=first["id"])
+        manager.append_audit("supplier_updated", "admin", "更新乙", supplier_id=second["id"])
+        with manager.db() as db:
+            db.execute("UPDATE audit_log SET time='2026-07-27T03:00:00Z' WHERE supplier_id=?", (first["id"],))
+            db.execute("UPDATE audit_log SET time='2026-07-28T03:00:00Z' WHERE supplier_id=?", (second["id"],))
+
+        supplied = manager.supply_history(supplier_id=first["id"], status="accepted", date_from="2026-07-27", date_to="2026-07-27")
+        self.assertEqual(1, len(supplied))
+        self.assertEqual("供应商甲", supplied[0]["supplier_name"])
+        audited = manager.audit_entries(supplier_id=first["id"], role="supplier", event="success", date_from="2026-07-27", date_to="2026-07-27")
+        self.assertEqual(1, len(audited))
+        self.assertEqual("supply_success", audited[0]["event"])
+
     def test_supplier_demand_explains_cooldown_without_exposing_target_groups(self):
         manager = self.make_manager()
         settings = default_settings()

@@ -215,9 +215,23 @@ class Manager:
         with self.db() as db:
             db.execute("INSERT INTO audit_log(time,event,role,message,group_id,count,supplier_id) VALUES(?,?,?,?,?,?,?)", (iso_now(), event, role, message, group_id, count, supplier_id))
 
-    def audit_entries(self, limit: int = 100) -> list[dict[str, Any]]:
+    def audit_entries(self, limit: int = 200, supplier_id: int = 0, role: str = "", event: str = "", date_from: str = "", date_to: str = "") -> list[dict[str, Any]]:
+        clauses, values = [], []
+        if supplier_id > 0:
+            clauses.append("supplier_id=?"); values.append(supplier_id)
+        if role:
+            if role not in {"admin", "supplier", "system", "test"}:
+                raise ValueError("审计角色筛选无效")
+            clauses.append("role=?"); values.append(role)
+        if event:
+            clauses.append("event LIKE ?"); values.append(f"%{event[:100]}%")
+        if date_from:
+            clauses.append("date(time)>=date(?)"); values.append(validate_date_filter(date_from))
+        if date_to:
+            clauses.append("date(time)<=date(?)"); values.append(validate_date_filter(date_to))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.db() as db:
-            rows = db.execute("SELECT time,event,role,message,group_id,count,supplier_id FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = db.execute(f"SELECT time,event,role,message,group_id,count,supplier_id FROM audit_log{where} ORDER BY id DESC LIMIT ?", (*values, limit)).fetchall()
         return [dict(row) for row in rows]
 
     def create_session(self, role: str, supplier_id: int | None = None) -> tuple[str, datetime]:
@@ -310,6 +324,22 @@ class Manager:
         self.append_audit("supplier_updated", "admin", f"更新供应商 ID {supplier_id}", supplier_id=supplier_id)
         return {"ok": True}
 
+    def rotate_supplier_key(self, supplier_id: int) -> dict[str, Any]:
+        raw_key = "sup_" + secrets.token_urlsafe(32)
+        with self.db() as db:
+            cursor = db.execute(
+                "UPDATE suppliers SET key_hash=?,key_prefix=? WHERE id=? AND deleted=0",
+                (self.supplier_key_hash(raw_key), raw_key[:12], supplier_id),
+            )
+            if not cursor.rowcount:
+                raise ValueError("供应商不存在")
+        with self.lock:
+            for token, session in list(self.sessions.items()):
+                if session.get("role") == "supplier" and int(session.get("supplier_id") or 0) == supplier_id:
+                    self.sessions.pop(token, None)
+        self.append_audit("supplier_key_rotated", "admin", f"重置供应商 ID {supplier_id} 的密钥", supplier_id=supplier_id)
+        return {"id": supplier_id, "key": raw_key, "key_prefix": raw_key[:12]}
+
     def delete_supplier(self, supplier_id: int) -> dict[str, Any]:
         tombstone_hash = self.supplier_key_hash("deleted-" + secrets.token_urlsafe(32))
         with self.db() as db:
@@ -323,14 +353,26 @@ class Manager:
         self.append_audit("supplier_deleted", "admin", f"删除供应商 ID {supplier_id}", supplier_id=supplier_id)
         return {"ok": True}
 
-    def supply_history(self, limit: int = 200) -> list[dict[str, Any]]:
+    def supply_history(self, limit: int = 500, supplier_id: int = 0, status: str = "", date_from: str = "", date_to: str = "") -> list[dict[str, Any]]:
+        clauses, values = [], []
+        if supplier_id > 0:
+            clauses.append("a.supplier_id=?"); values.append(supplier_id)
+        if status:
+            if status not in {"accepted", "rejected"}:
+                raise ValueError("补号结果筛选无效")
+            clauses.append("a.status=?"); values.append(status)
+        if date_from:
+            clauses.append("date(a.created_at)>=date(?)"); values.append(validate_date_filter(date_from))
+        if date_to:
+            clauses.append("date(a.created_at)<=date(?)"); values.append(validate_date_filter(date_to))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.db() as db:
-            rows = db.execute("""
+            rows = db.execute(f"""
                 SELECT a.id,a.batch_id,a.supplier_id,s.name supplier_name,a.upstream_account_id,
                        a.account_name,a.email,a.status,a.target_group_ids_json,a.error_message,a.created_at
                 FROM supplied_accounts a JOIN suppliers s ON s.id=a.supplier_id
-                ORDER BY a.id DESC LIMIT ?
-            """, (limit,)).fetchall()
+                {where} ORDER BY a.id DESC LIMIT ?
+            """, (*values, limit)).fetchall()
         output = []
         for row in rows:
             item = dict(row); item["target_group_ids"] = json.loads(item.pop("target_group_ids_json")); output.append(item)
@@ -638,6 +680,15 @@ def bounded(value: Any, low: float, high: float, label: str) -> None:
         raise ValueError(f"{label}必须在 {low:g}..{high:g} 范围")
 
 
+def validate_date_filter(value: str) -> str:
+    value = value.strip()
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as error:
+        raise ValueError("日期筛选必须是 YYYY-MM-DD") from error
+    return value
+
+
 def reconcile_policies(existing: list[dict[str, Any]], groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_id = {int(item["group_id"]): item for item in existing}
     output = []
@@ -688,11 +739,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/admin/bootstrap":
             return self.protected("admin", lambda: self.manager.bootstrap())
         if path == "/api/admin/audit":
-            return self.protected("admin", lambda: {"entries": self.manager.audit_entries()})
+            return self.protected("admin", lambda: {"entries": self.manager.audit_entries(
+                supplier_id=self.query_int("supplier_id"), role=self.query_value("role"), event=self.query_value("event"),
+                date_from=self.query_value("date_from"), date_to=self.query_value("date_to"),
+            )})
         if path == "/api/admin/suppliers":
             return self.protected("admin", lambda: {"suppliers": self.manager.list_suppliers()})
         if path == "/api/admin/supplies":
-            return self.protected("admin", lambda: {"accounts": self.manager.supply_history()})
+            return self.protected("admin", lambda: {"accounts": self.manager.supply_history(
+                supplier_id=self.query_int("supplier_id"), status=self.query_value("status"),
+                date_from=self.query_value("date_from"), date_to=self.query_value("date_to"),
+            )})
         if path == "/api/supplier/demand":
             return self.protected("supplier", lambda: self.manager.supplier_demand())
         if path == "/api/supplier/v1/demand":
@@ -718,6 +775,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/admin/suppliers":
             return self.protected("admin", lambda: self.manager.create_supplier(str(self.read_json(8192).get("name", ""))))
+        prefix = "/api/admin/suppliers/"
+        suffix = "/rotate-key"
+        if path.startswith(prefix) and path.endswith(suffix) and path[len(prefix):-len(suffix)].isdigit():
+            supplier_id = int(path[len(prefix):-len(suffix)])
+            return self.protected("admin", lambda: self.manager.rotate_supplier_key(supplier_id))
         if path == "/api/supplier/supply":
             def supply() -> dict[str, Any]:
                 body = self.read_json(2 * 1024 * 1024)
@@ -833,6 +895,18 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             raise ValueError("请求体必须是对象")
         return value
+
+    def query_value(self, name: str) -> str:
+        values = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get(name, [])
+        return str(values[0]).strip() if values else ""
+
+    def query_int(self, name: str) -> int:
+        value = self.query_value(name)
+        if not value:
+            return 0
+        if not value.isdigit():
+            raise ValueError(f"{name} 必须是正整数")
+        return int(value)
 
     def session_token(self) -> str:
         cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
