@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>账号池补号中心</title>
-  <link rel="stylesheet" href="/app.css?v=4">
-  <link rel="stylesheet" href="/admin.css?v=4">
+  <link rel="stylesheet" href="/app.css?v=5">
+  <link rel="stylesheet" href="/admin.css?v=5">
 </head>
 <body>
   <div class="page-shell">
@@ -51,12 +51,12 @@
             <label>单次补号上限<input id="maxPerRun" type="number" min="1" max="100"></label>
             <label>条件组合<select id="triggerMode"><option value="any">任一条件触发</option><option value="all">全部条件触发</option></select></label>
           </div>
-          <label class="danger-toggle"><input id="supplierAutoImport" type="checkbox"><span><strong>允许供应商直接补号</strong><small>开启后，供应商提交的 Token 会立即写入 Codex2API。默认关闭。</small></span></label>
+          <label class="danger-toggle"><input id="supplierAutoImport" type="checkbox"><span><strong>允许供应商直接补号（网页与 API）</strong><small>关闭时仍可查询缺口，但网页提交和 POST 供应商 API 都会被拒绝；默认关闭。</small></span></label>
         </section>
 
         <section class="panel">
           <div class="panel-head"><div><h2>供应商密钥</h2><p>管理员创建独立密钥；密钥只显示一次，可随时禁用。供应商网页和 API 使用同一密钥。</p></div></div>
-          <div class="supplier-admin-create"><input id="newSupplierName" maxlength="100" placeholder="供应商名称"><button class="button primary" id="createSupplier" type="button">创建供应商密钥</button><code id="supplierKeyReveal"></code></div>
+          <div class="supplier-admin-create"><input id="newSupplierName" maxlength="100" placeholder="供应商名称"><button class="button primary" id="createSupplier" type="button">创建供应商密钥</button><div class="key-reveal"><code id="supplierKeyReveal"></code><button class="button ghost" id="copySupplierKey" type="button" disabled>复制密钥</button></div></div>
           <div class="table-scroll"><table class="policy-table compact-table"><thead><tr><th>供应商</th><th>密钥前缀</th><th>状态</th><th>通过账号</th><th>最近使用</th><th>操作</th></tr></thead><tbody id="supplierRows"></tbody></table></div>
         </section>
 
@@ -107,6 +107,6 @@
       </section>
     </main>
   </div>
-  <script src="/app.js?v=4" defer></script>
+  <script src="/app.js?v=5" defer></script>
 </body>
 </html>

@@ -132,6 +132,7 @@ class Manager:
                     key_hash TEXT NOT NULL UNIQUE,
                     key_prefix TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    deleted INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     last_used_at TEXT
                 );
@@ -174,6 +175,9 @@ class Manager:
                 CREATE INDEX IF NOT EXISTS idx_supplied_accounts_supplier ON supplied_accounts(supplier_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(id DESC);
             """)
+            supplier_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(suppliers)").fetchall()}
+            if "deleted" not in supplier_columns:
+                db.execute("ALTER TABLE suppliers ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
 
     def _load_settings(self) -> dict[str, Any]:
         with self.db() as db:
@@ -235,8 +239,8 @@ class Manager:
             supplier_id = session.get("supplier_id")
         if role == "supplier":
             with self.db() as db:
-                row = db.execute("SELECT enabled FROM suppliers WHERE id=?", (int(supplier_id or 0),)).fetchone()
-            if not row or not bool(row["enabled"]):
+                row = db.execute("SELECT enabled,deleted FROM suppliers WHERE id=?", (int(supplier_id or 0),)).fetchone()
+            if not row or not bool(row["enabled"]) or bool(row["deleted"]):
                 with self.lock:
                     self.sessions.pop(token, None)
                 return None
@@ -270,8 +274,8 @@ class Manager:
             return None
         digest = self.supplier_key_hash(raw_key)
         with self.db() as db:
-            row = db.execute("SELECT id,name,enabled FROM suppliers WHERE key_hash=?", (digest,)).fetchone()
-            if not row or not bool(row["enabled"]):
+            row = db.execute("SELECT id,name,enabled,deleted FROM suppliers WHERE key_hash=?", (digest,)).fetchone()
+            if not row or not bool(row["enabled"]) or bool(row["deleted"]):
                 return None
             db.execute("UPDATE suppliers SET last_used_at=? WHERE id=?", (iso_now(), int(row["id"])))
         return {"id": int(row["id"]), "name": str(row["name"])}
@@ -282,6 +286,7 @@ class Manager:
                 SELECT s.id,s.name,s.key_prefix,s.enabled,s.created_at,s.last_used_at,
                        COUNT(DISTINCT b.id) batch_count,COALESCE(SUM(b.accepted_count),0) accepted_count
                 FROM suppliers s LEFT JOIN supply_batches b ON b.supplier_id=s.id
+                WHERE s.deleted=0
                 GROUP BY s.id ORDER BY s.id DESC
             """).fetchall()
         return [{**dict(row), "enabled": bool(row["enabled"])} for row in rows]
@@ -299,10 +304,23 @@ class Manager:
             raise ValueError("没有可更新字段")
         values.append(supplier_id)
         with self.db() as db:
-            cursor = db.execute(f"UPDATE suppliers SET {','.join(fields)} WHERE id=?", values)
+            cursor = db.execute(f"UPDATE suppliers SET {','.join(fields)} WHERE id=? AND deleted=0", values)
             if not cursor.rowcount:
                 raise ValueError("供应商不存在")
         self.append_audit("supplier_updated", "admin", f"更新供应商 ID {supplier_id}", supplier_id=supplier_id)
+        return {"ok": True}
+
+    def delete_supplier(self, supplier_id: int) -> dict[str, Any]:
+        tombstone_hash = self.supplier_key_hash("deleted-" + secrets.token_urlsafe(32))
+        with self.db() as db:
+            cursor = db.execute("UPDATE suppliers SET enabled=0,deleted=1,key_hash=?,key_prefix='' WHERE id=? AND deleted=0", (tombstone_hash, supplier_id))
+            if not cursor.rowcount:
+                raise ValueError("供应商不存在或已删除")
+        with self.lock:
+            for token, session in list(self.sessions.items()):
+                if session.get("role") == "supplier" and int(session.get("supplier_id") or 0) == supplier_id:
+                    self.sessions.pop(token, None)
+        self.append_audit("supplier_deleted", "admin", f"删除供应商 ID {supplier_id}", supplier_id=supplier_id)
         return {"ok": True}
 
     def supply_history(self, limit: int = 200) -> list[dict[str, Any]]:
@@ -449,14 +467,26 @@ class Manager:
         settings = self.settings_snapshot()
         settings["groups"] = reconcile_policies(settings["groups"], groups)
         evaluations = self.evaluate(groups, accounts, settings)
-        group_names = {int(group["id"]): str(group.get("name", group["id"])) for group in groups}
-        demands = [{
-            "group_id": item["group_id"], "group_name": item["group_name"], "color": item["color"],
-            "needed": item["recommended_count"], "accepting": item["accepting_supply"], "reasons": item["reasons"],
-            "target_group_ids": item["policy"]["target_group_ids"],
-            "target_group_names": [group_names.get(group_id, f"ID {group_id}") for group_id in item["policy"]["target_group_ids"]],
-            "note": item["policy"].get("supplier_note", ""),
-        } for item in evaluations if item["policy"]["enabled"]]
+        demands = []
+        for item in evaluations:
+            if not item["policy"]["enabled"]:
+                continue
+            if item["accepting_supply"]:
+                state, status_text = "accepting", "可提交"
+            elif not settings["global"]["supplier_auto_import"]:
+                state, status_text = "direct_import_disabled", "管理员未开启直补"
+            elif item["in_cooldown"]:
+                state, status_text = "cooldown", "冷却中"
+            elif not item["triggered"] or item["recommended_count"] <= 0:
+                state, status_text = "not_triggered", "未触发补号"
+            else:
+                state, status_text = "unavailable", "暂不可提交"
+            demands.append({
+                "group_id": item["group_id"], "group_name": item["group_name"], "color": item["color"],
+                "needed": item["recommended_count"], "accepting": item["accepting_supply"],
+                "state": state, "status_text": status_text, "cooldown_until": item["cooldown_until"],
+                "reasons": item["reasons"], "note": item["policy"].get("supplier_note", ""),
+            })
         return {"demands": demands, "direct_import_enabled": settings["global"]["supplier_auto_import"], "updated_at": iso_now()}
 
     def start_monitor(self) -> None:
@@ -571,7 +601,7 @@ class Manager:
             self.append_audit("supply_success", "supplier", "供应商提交并通过存活校验", group_id, accepted, supplier_id)
         if failed:
             self.append_audit("supply_rejected", "supplier", "部分账号未通过存活校验", group_id, failed, supplier_id)
-        return {"ok": True, "batch_id": batch_id, "requested": len(tokens), "accepted": accepted, "failed": failed, "needed_before": limit, "group_id": group_id, "target_group_ids": target_group_ids, "results": results}
+        return {"ok": True, "batch_id": batch_id, "requested": len(tokens), "accepted": accepted, "failed": failed, "needed_before": limit, "group_id": group_id, "results": results}
 
 
 def validate_settings(data: dict[str, Any]) -> None:
@@ -721,6 +751,16 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith(prefix) and path[len(prefix):].isdigit():
             supplier_id = int(path[len(prefix):])
             return self.protected("admin", lambda: self.manager.update_supplier(supplier_id, self.read_json(8192)))
+        self.json_response(404, {"error": "not found"})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        path = urllib.parse.urlsplit(self.path).path
+        if not self.valid_origin():
+            return self.json_response(403, {"error": "来源校验失败"})
+        prefix = "/api/admin/suppliers/"
+        if path.startswith(prefix) and path[len(prefix):].isdigit():
+            supplier_id = int(path[len(prefix):])
+            return self.protected("admin", lambda: self.manager.delete_supplier(supplier_id))
         self.json_response(404, {"error": "not found"})
 
     def login(self, role: str) -> None:

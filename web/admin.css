@@ -12,6 +12,9 @@
   font-size: 12px;
 }
 
+.key-reveal { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.key-reveal code { flex: 1; }
+
 .compact-table { min-width: 760px; }
 .target-groups { min-width: 150px; min-height: 76px; padding: 5px; }
 .status-ok { color: var(--green); font-weight: 700; }

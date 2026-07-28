@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const state = { role: location.hash === "#supplier" ? "supplier" : "admin", bootstrap: null, demands: [], directImportEnabled: false };
+const state = { role: location.hash === "#supplier" ? "supplier" : "admin", bootstrap: null, demands: [], directImportEnabled: false, lastSupplierKey: "" };
 
 async function api(path, options = {}) {
   const response = await fetch(path, { credentials: "same-origin", ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
@@ -136,9 +136,14 @@ async function loadAudit() {
 
 async function loadSuppliers() {
   const data = await api("/api/admin/suppliers");
-  $("supplierRows").innerHTML = data.suppliers.length ? data.suppliers.map((item) => `<tr><td><strong>${esc(item.name)}</strong><span class="subtext">ID ${item.id} · ${new Date(item.created_at).toLocaleString()}</span></td><td><code>${esc(item.key_prefix)}…</code></td><td><span class="state-badge ${item.enabled ? "" : "disabled"}">${item.enabled ? "启用" : "已禁用"}</span></td><td>${item.accepted_count}</td><td>${item.last_used_at ? new Date(item.last_used_at).toLocaleString() : "从未"}</td><td><button class="button ghost supplier-toggle" data-id="${item.id}" data-enabled="${item.enabled}">${item.enabled ? "禁用" : "启用"}</button></td></tr>`).join("") : `<tr><td colspan="6" class="empty">尚未创建供应商</td></tr>`;
+  $("supplierRows").innerHTML = data.suppliers.length ? data.suppliers.map((item) => `<tr><td><strong>${esc(item.name)}</strong><span class="subtext">ID ${item.id} · ${new Date(item.created_at).toLocaleString()}</span></td><td><code>${esc(item.key_prefix)}…</code></td><td><span class="state-badge ${item.enabled ? "" : "disabled"}">${item.enabled ? "启用" : "已禁用"}</span></td><td>${item.accepted_count}</td><td>${item.last_used_at ? new Date(item.last_used_at).toLocaleString() : "从未"}</td><td><div class="heading-actions"><button class="button ghost supplier-toggle" type="button" data-id="${item.id}" data-enabled="${item.enabled}">${item.enabled ? "禁用" : "启用"}</button><button class="button ghost supplier-delete" type="button" data-id="${item.id}" data-name="${esc(item.name)}">删除</button></div></td></tr>`).join("") : `<tr><td colspan="6" class="empty">尚未创建供应商</td></tr>`;
   document.querySelectorAll(".supplier-toggle").forEach((button) => button.addEventListener("click", async () => {
     await api(`/api/admin/suppliers/${button.dataset.id}`, { method: "PATCH", body: JSON.stringify({ enabled: button.dataset.enabled !== "true" }) });
+    await loadSuppliers();
+  }));
+  document.querySelectorAll(".supplier-delete").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm(`确定删除供应商“${button.dataset.name}”？该密钥将立即失效，历史补号记录会保留。`)) return;
+    await api(`/api/admin/suppliers/${button.dataset.id}`, { method: "DELETE", body: "{}" });
     await loadSuppliers();
   }));
 }
@@ -150,11 +155,30 @@ async function createSupplier() {
   button.disabled = true; button.textContent = "创建中…";
   try {
     const result = await api("/api/admin/suppliers", { method: "POST", body: JSON.stringify({ name }) });
+    state.lastSupplierKey = result.key;
     $("supplierKeyReveal").textContent = `请立即复制（只显示一次）：${result.key}`;
+    $("copySupplierKey").disabled = false;
+    $("copySupplierKey").textContent = "复制密钥";
     $("newSupplierName").value = "";
     await loadSuppliers();
   } catch (error) { $("supplierKeyReveal").textContent = error.message; }
   finally { button.disabled = false; button.textContent = "创建供应商密钥"; }
+}
+
+async function copySupplierKey() {
+  if (!state.lastSupplierKey) return;
+  try {
+    await navigator.clipboard.writeText(state.lastSupplierKey);
+    $("copySupplierKey").textContent = "已复制";
+  } catch (_) {
+    const area = document.createElement("textarea");
+    area.value = state.lastSupplierKey; area.setAttribute("readonly", "");
+    area.style.position = "fixed"; area.style.opacity = "0";
+    document.body.appendChild(area); area.select();
+    const copied = document.execCommand("copy"); area.remove();
+    if (copied) $("copySupplierKey").textContent = "已复制";
+    else $("supplierKeyReveal").textContent = `复制失败，请手动复制：${state.lastSupplierKey}`;
+  }
 }
 
 async function loadSupplies() {
@@ -171,8 +195,8 @@ async function loadSupplier() {
   hide("adminView"); show("supplierView");
   $("connectionState").textContent = "供应商会话";
   $("supplierModeText").textContent = data.direct_import_enabled ? "管理员已开启直接补号。" : "管理员尚未开启直接补号，目前只能查看需求。";
-  $("demandGrid").innerHTML = data.demands.length ? data.demands.map((item) => `<article class="demand-card"><div class="demand-top"><span class="group-name"><i class="group-dot" style="--group-color:${esc(item.color || "#777")}"></i>检查：${esc(item.group_name)}</span><span class="state-badge ${item.accepting ? "triggered" : "disabled"}">${item.accepting ? "可提交" : "暂不接收"}</span></div><div class="demand-number">${item.needed}</div><span class="subtext">需要补充的存活账号</span><ul>${(item.reasons || []).map((reason) => `<li>${esc(reason)}</li>`).join("")}<li>入组：${(item.target_group_names || []).map(esc).join(" + ")}</li></ul>${item.note ? `<p class="subtext">备注：${esc(item.note)}</p>` : ""}</article>`).join("") : `<div class="empty">当前没有已启用的补号策略</div>`;
-  $("supplyGroup").innerHTML = data.demands.map((item) => `<option value="${item.group_id}">${esc(item.group_name)} · 需要 ${item.needed} · ${item.accepting ? "可提交" : "暂不接收"}</option>`).join("");
+  $("demandGrid").innerHTML = data.demands.length ? data.demands.map((item) => `<article class="demand-card"><div class="demand-top"><span class="group-name"><i class="group-dot" style="--group-color:${esc(item.color || "#777")}"></i>检查：${esc(item.group_name)}</span><span class="state-badge ${item.accepting ? "triggered" : "disabled"}">${esc(item.status_text || (item.accepting ? "可提交" : "暂不可提交"))}</span></div><div class="demand-number">${item.needed}</div><span class="subtext">需要补充的存活账号</span><ul>${(item.reasons || []).map((reason) => `<li>${esc(reason)}</li>`).join("")}</ul>${item.note ? `<p class="subtext">备注：${esc(item.note)}</p>` : ""}</article>`).join("") : `<div class="empty">当前没有已启用的补号策略</div>`;
+  $("supplyGroup").innerHTML = data.demands.map((item) => `<option value="${item.group_id}">${esc(item.group_name)} · 需要 ${item.needed} · ${esc(item.status_text || (item.accepting ? "可提交" : "暂不可提交"))}</option>`).join("");
   const selected = data.demands.find((item) => item.group_id === previousGroupId) || data.demands.find((item) => item.accepting) || data.demands[0];
   if (selected) $("supplyGroup").value = String(selected.group_id);
   $("supplyGroup").disabled = data.demands.length === 0;
@@ -183,7 +207,7 @@ function updateSupplierLimit() {
   const selected = state.demands.find((item) => item.group_id === Number($("supplyGroup").value));
   const tokenCount = $("supplyTokens").value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length;
   $("supplierTokenCount").textContent = `${tokenCount} 个 Token`;
-  $("supplierLimit").textContent = selected?.accepting ? `当前最多接收 ${selected.needed} 个` : selected ? `当前暂不接收：${(selected.reasons || []).join("；") || "策略未触发"}` : "当前没有检查策略";
+  $("supplierLimit").textContent = selected?.accepting ? `当前最多接收 ${selected.needed} 个` : selected ? `${selected.status_text || "暂不可提交"}：${(selected.reasons || []).join("；") || "策略未触发"}` : "当前没有检查策略";
   $("submitSupply").disabled = !state.directImportEnabled || !selected?.accepting;
 }
 
@@ -204,6 +228,6 @@ async function submitSupply(event) {
 window.addEventListener("hashchange", () => location.reload());
 $("loginForm").addEventListener("submit", login); $("logoutButton").addEventListener("click", logout);
 $("refreshAdmin").addEventListener("click", loadAdmin); $("saveSettings").addEventListener("click", saveSettings); $("refreshAudit").addEventListener("click", loadAudit);
-$("createSupplier").addEventListener("click", createSupplier); $("refreshSupplies").addEventListener("click", loadSupplies);
+$("createSupplier").addEventListener("click", createSupplier); $("copySupplierKey").addEventListener("click", copySupplierKey); $("refreshSupplies").addEventListener("click", loadSupplies);
 $("refreshSupplier").addEventListener("click", loadSupplier); $("supplyGroup").addEventListener("change", updateSupplierLimit); $("supplyTokens").addEventListener("input", updateSupplierLimit); $("supplyForm").addEventListener("submit", submitSupply);
 configureLogin(); enterApp();

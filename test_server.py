@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from server import Config, Manager, configured_port, default_settings, is_usable, reconcile_policies, validate_settings
+from server import Config, Manager, configured_port, default_settings, is_usable, reconcile_policies, utc_now, validate_settings
 
 
 class ManagerLogicTests(unittest.TestCase):
@@ -89,6 +89,26 @@ class ManagerLogicTests(unittest.TestCase):
         manager.update_supplier(created["id"], {"enabled": False})
         self.assertIsNone(manager.authenticate_supplier(created["key"]))
         self.assertIsNone(manager.session_role(token))
+        manager.delete_supplier(created["id"])
+        self.assertEqual([], manager.list_suppliers())
+
+    def test_supplier_demand_explains_cooldown_without_exposing_target_groups(self):
+        manager = self.make_manager()
+        settings = default_settings()
+        settings["global"]["supplier_auto_import"] = True
+        settings["groups"] = [{
+            "group_id": 4, "enabled": True, "target_usable_count": 10, "min_usable_count": 8,
+            "min_remaining_7d_percent": 25, "trigger_on_usable": True,
+            "trigger_on_remaining_7d": False, "target_group_ids": [4, 5], "supplier_note": "",
+        }]
+        manager.save_settings(settings)
+        manager.last_supply[4] = utc_now()
+        manager.fetch_pool = lambda: ([{"id": 4, "name": "PLUS池"}, {"id": 5, "name": "分流分组"}], [])
+        demand = manager.supplier_demand()["demands"][0]
+        self.assertEqual("cooldown", demand["state"])
+        self.assertEqual("冷却中", demand["status_text"])
+        self.assertNotIn("target_group_ids", demand)
+        self.assertNotIn("target_group_names", demand)
 
     def test_supply_checks_one_group_and_binds_multiple_targets(self):
         manager = self.make_manager()
